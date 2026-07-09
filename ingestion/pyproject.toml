@@ -1,0 +1,20 @@
+[project]
+name = "septa-poller"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "alembic",
+    "gtfs-realtime-bindings==2.1.0",
+    "httpx",
+    "protobuf",
+    "psycopg2-binary",
+    "python-dateutil",
+    "python-dotenv",
+    "SQLAlchemy",
+]
+
+[tool.setuptools.packages.find]
+include = ["poller*"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
