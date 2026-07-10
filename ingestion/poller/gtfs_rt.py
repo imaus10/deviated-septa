@@ -70,7 +70,6 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
         if not predicted_ts_list:
             continue
 
-        # infer service date from the median predicted timestamp
         predicted_ts_list.sort()
         median_ts = predicted_ts_list[len(predicted_ts_list) // 2]
         service_date = datetime.fromtimestamp(median_ts, tz=timezone.utc).date()
@@ -117,161 +116,38 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
     return observations
 
 
-def load_stop_times(session, trip_ids: set[str]) -> dict:
-    from sqlalchemy import text
-
-    rows = session.execute(
-        text(
-            """
-        SELECT trip_id, stop_sequence, arrival_time, stop_id
-        FROM stop_times
-        WHERE trip_id = ANY(:trip_ids)
-        ORDER BY trip_id, stop_sequence
-        """
-        ),
-        {"trip_ids": list(trip_ids)},
-    ).fetchall()
+def load_stop_times(client, trip_ids: set[str]) -> dict:
+    resp = client.post("/rpc/get_stop_times", json={"req_trip_ids": list(trip_ids)})
+    resp.raise_for_status()
+    rows = resp.json()
 
     cache: dict[str, dict[int, dict]] = {}
     for row in rows:
-        tid = row[0]
-        seq = row[1]
+        tid = row["trip_id"]
+        seq = row["stop_sequence"]
         if tid not in cache:
             cache[tid] = {}
         cache[tid][seq] = {
-            "arrival_time": row[2],
-            "stop_id": row[3],
+            "arrival_time": row["arrival_time"],
+            "stop_id": row["stop_id"],
         }
     return cache
 
 
-def build_aggregations(session):
-    from sqlalchemy import text
+def build_aggregations(client):
+    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
-    today = now.date()
+    today_str = now.date().isoformat()
 
-    # Use the latest prediction per (trip, stop, day) so each scheduled stop
-    # counts at most once — the prediction closest to when the bus actually arrives.
-    cte = """
-        WITH latest AS (
-            SELECT DISTINCT ON (trip_id, stop_id, stop_sequence, poll_timestamp::date)
-                route_id,
-                delay_seconds,
-                poll_timestamp
-            FROM arrival_records
-            WHERE poll_timestamp >= DATE(:today)
-            ORDER BY trip_id, stop_id, stop_sequence, poll_timestamp::date, poll_timestamp DESC
-        )
-    """
+    resp = client.post("/rpc/agg_daily", json={"poll_date": today_str})
+    resp.raise_for_status()
+    print("  daily aggregation done")
 
-    # --- daily aggregation ---
-    session.execute(
-        text(
-            cte
-            + """
-        INSERT INTO daily_route_metrics
-            (route_id, date, total_observations, early_count, on_time_count, late_count,
-             on_time_percentage, avg_delay_seconds)
-        SELECT
-            route_id,
-            DATE(poll_timestamp) AS date,
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE delay_seconds < -60) AS early,
-            COUNT(*) FILTER (WHERE delay_seconds BETWEEN -60 AND 300) AS on_time,
-            COUNT(*) FILTER (WHERE delay_seconds > 300) AS late,
-            ROUND(
-                100.0 * COUNT(*) FILTER (WHERE delay_seconds BETWEEN -60 AND 300)
-                / NULLIF(COUNT(*), 0), 1
-            ),
-            ROUND(AVG(delay_seconds)::numeric, 1)
-        FROM latest
-        GROUP BY route_id, DATE(poll_timestamp)
-        ON CONFLICT (route_id, date)
-        DO UPDATE SET
-            total_observations = EXCLUDED.total_observations,
-            early_count       = EXCLUDED.early_count,
-            on_time_count     = EXCLUDED.on_time_count,
-            late_count        = EXCLUDED.late_count,
-            on_time_percentage = EXCLUDED.on_time_percentage,
-            avg_delay_seconds  = EXCLUDED.avg_delay_seconds
-        """
-        ),
-        {"today": today.isoformat()},
-    )
+    resp = client.post("/rpc/agg_hourly", json={"poll_date": today_str})
+    resp.raise_for_status()
+    print("  hourly aggregation done")
 
-    # --- hourly aggregation ---
-    session.execute(
-        text(
-            cte
-            + """
-        INSERT INTO hourly_route_metrics
-            (route_id, date, hour, total_observations, early_count, on_time_count,
-             late_count, on_time_percentage, avg_delay_seconds)
-        SELECT
-            route_id,
-            DATE(poll_timestamp) AS date,
-            EXTRACT(HOUR FROM poll_timestamp)::int AS hour,
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE delay_seconds < -60) AS early,
-            COUNT(*) FILTER (WHERE delay_seconds BETWEEN -60 AND 300) AS on_time,
-            COUNT(*) FILTER (WHERE delay_seconds > 300) AS late,
-            ROUND(
-                100.0 * COUNT(*) FILTER (WHERE delay_seconds BETWEEN -60 AND 300)
-                / NULLIF(COUNT(*), 0), 1
-            ),
-            ROUND(AVG(delay_seconds)::numeric, 1)
-        FROM latest
-        GROUP BY route_id, DATE(poll_timestamp), EXTRACT(HOUR FROM poll_timestamp)
-        ON CONFLICT (route_id, date, hour)
-        DO UPDATE SET
-            total_observations = EXCLUDED.total_observations,
-            early_count       = EXCLUDED.early_count,
-            on_time_count     = EXCLUDED.on_time_count,
-            late_count        = EXCLUDED.late_count,
-            on_time_percentage = EXCLUDED.on_time_percentage,
-            avg_delay_seconds  = EXCLUDED.avg_delay_seconds
-        """
-        ),
-        {"today": today.isoformat()},
-    )
-
-    # --- latest snapshot ---
-    session.execute(
-        text(
-            """
-        INSERT INTO latest_snapshot
-            (route_id, route_name, route_type, total_observations,
-             early_count, on_time_count, late_count,
-             on_time_percentage, avg_delay_seconds, updated_at)
-        SELECT
-            m.route_id,
-            r.route_short_name,
-            r.route_type,
-            m.total_observations,
-            m.early_count,
-            m.on_time_count,
-            m.late_count,
-            m.on_time_percentage,
-            m.avg_delay_seconds,
-            :now AS updated_at
-        FROM daily_route_metrics m
-        LEFT JOIN routes r ON r.route_id = m.route_id
-        WHERE m.date = :today
-        ON CONFLICT (route_id)
-        DO UPDATE SET
-            route_name         = EXCLUDED.route_name,
-            route_type         = EXCLUDED.route_type,
-            total_observations = EXCLUDED.total_observations,
-            early_count       = EXCLUDED.early_count,
-            on_time_count     = EXCLUDED.on_time_count,
-            late_count        = EXCLUDED.late_count,
-            on_time_percentage = EXCLUDED.on_time_percentage,
-            avg_delay_seconds  = EXCLUDED.avg_delay_seconds,
-            updated_at        = EXCLUDED.updated_at
-        """
-        ),
-        {"today": today.isoformat(), "now": now},
-    )
-
-    session.commit()
+    resp = client.post("/rpc/agg_snapshot", json={"poll_date": today_str, "now": now.isoformat()})
+    resp.raise_for_status()
+    print("  snapshot done")

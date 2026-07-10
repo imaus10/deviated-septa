@@ -1,94 +1,83 @@
-from pathlib import Path
+import sys
+from datetime import datetime, timezone
 
-import alembic.config
-import alembic.command
-
-from poller.db import Session
-from poller.models import StopTime, ArrivalRecord
-from poller import gtfs_static, gtfs_rt
-
-
-def run_migrations():
-    alembic_cfg = alembic.config.Config(
-        str(Path(__file__).parent.parent / "alembic.ini")
-    )
-    alembic.command.upgrade(alembic_cfg, "head")
-
-
-def ensure_gtfs_static():
-    session = Session()
-    try:
-        existing = session.query(StopTime).first()
-        if existing is not None:
-            print("GTFS static data already loaded, skipping import")
-            return
-    finally:
-        session.close()
-
-    print("GTFS static data not found — downloading and importing...")
-    gtfs_static.run()
-    print("GTFS static import complete")
-
-
-def run_poll():
-    session = Session()
-    try:
-        print("Fetching GTFS-RT trip updates...")
-        raw = gtfs_rt.fetch_protobuf(gtfs_rt.BUS_TRIP_UPDATES)
-        feed = gtfs_rt.parse_trip_updates(raw)
-        print(f"  feed timestamp: {feed.header.timestamp}")
-        print(f"  entities: {len(feed.entity)}")
-
-        trip_ids = set()
-        for entity in feed.entity:
-            if entity.HasField("trip_update"):
-                trip_ids.add(entity.trip_update.trip.trip_id)
-
-        print(f"  unique trip_ids: {len(trip_ids)}")
-
-        if not trip_ids:
-            print("  no trip updates to process")
-            return
-
-        stop_times_cache = gtfs_rt.load_stop_times(session, trip_ids)
-        print(f"  matched {len(stop_times_cache)} trips to stop_times")
-
-        observations = gtfs_rt.extract_observations(feed, stop_times_cache)
-        print(f"  extracted {len(observations)} stop observations")
-
-        if not observations:
-            print("  no observations to insert")
-            return
-
-        records = [ArrivalRecord(**obs) for obs in observations]
-        session.bulk_save_objects(records)
-        session.commit()
-        print(f"  inserted {len(records)} arrival records")
-
-        print("Building aggregations...")
-        gtfs_rt.build_aggregations(session)
-        print("  aggregations updated")
-
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+import poller.gtfs_rt as gtfs_rt
+import poller.gtfs_static as gtfs_static
+from poller.db import get_client, json_dumps
 
 
 def main():
-    print("=" * 50)
-    print("SEPTA Reliability Poller")
-    print("=" * 50)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] starting poll cycle", flush=True)
 
-    run_migrations()
-    print("Migrations up to date")
+    client = get_client()
 
-    ensure_gtfs_static()
+    # Only import static data once — routes table is small and quick to check.
+    today = datetime.now(timezone.utc).date()
+    try:
+        resp = client.get("/routes", params={"select": "route_id", "limit": 1})
+        resp.raise_for_status()
+        static_loaded = len(resp.json()) > 0
+    except Exception:
+        static_loaded = False
 
-    run_poll()
-    print("Done")
+    if not static_loaded:
+        print("no static data found; importing GTFS static data", flush=True)
+        gtfs_static.run(client)
+
+    print("fetching trip updates...", flush=True)
+    raw = gtfs_rt.fetch_protobuf(gtfs_rt.BUS_TRIP_UPDATES)
+    feed = gtfs_rt.parse_trip_updates(raw)
+
+    # Collect unique trip_ids from the feed
+    trip_ids = {
+        e.trip_update.trip.trip_id
+        for e in feed.entity
+        if e.HasField("trip_update")
+        and e.trip_update.trip.schedule_relationship
+        != gtfs_rt.gtfs_realtime_pb2.TripDescriptor.CANCELED
+    }
+
+    if not trip_ids:
+        print("no active trips in feed", flush=True)
+        client.close()
+        return
+
+    print(f"  {len(trip_ids)} active trips in feed", flush=True)
+
+    stop_cache = gtfs_rt.load_stop_times(client, trip_ids)
+    if not stop_cache:
+        print("no matching stop_times found; static data may need refresh", flush=True)
+        client.close()
+        return
+
+    observations = gtfs_rt.extract_observations(feed, stop_cache)
+    print(f"  {len(observations)} observations extracted", flush=True)
+
+    if observations:
+        batch = []
+        for obs in observations:
+            batch.append(obs)
+            if len(batch) >= 1000:
+                resp = client.post("/arrival_records", content=json_dumps(batch),
+                                   headers={"Prefer": "return=minimal"})
+                resp.raise_for_status()
+                batch.clear()
+        if batch:
+            resp = client.post("/arrival_records", content=json_dumps(batch),
+                               headers={"Prefer": "return=minimal"})
+            resp.raise_for_status()
+
+        print("  running aggregations...", flush=True)
+        gtfs_rt.build_aggregations(client)
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] poll cycle complete", flush=True)
+    client.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

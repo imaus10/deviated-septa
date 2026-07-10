@@ -1,24 +1,27 @@
-name: Poll SEPTA GTFS-RT
+name: Poll SEPTA
 
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+defaults:
+  run:
+    working-directory: ingestion
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
 jobs:
   poll:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ingestion
-    env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: astral-sh/setup-uv@v5
         with:
+          version: "latest"
           python-version: "3.12"
 
       - run: uv sync --frozen --extra dev
