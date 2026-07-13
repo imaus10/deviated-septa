@@ -62,18 +62,6 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
         if not stop_times:
             continue
 
-        predicted_ts_list = [
-            stu.arrival.time
-            for stu in tu.stop_time_update
-            if stu.HasField("arrival") and stu.arrival.time > 0
-        ]
-        if not predicted_ts_list:
-            continue
-
-        predicted_ts_list.sort()
-        median_ts = predicted_ts_list[len(predicted_ts_list) // 2]
-        service_date = datetime.fromtimestamp(median_ts, tz=timezone.utc).date()
-
         vehicle_id = tu.vehicle.id if tu.vehicle.id else None
 
         for stu in tu.stop_time_update:
@@ -88,6 +76,10 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
             if scheduled_row is None:
                 continue
 
+            # Infer service date from the predicted arrival in Eastern time.
+            # This handles trips that cross midnight correctly — each stop
+            # uses its own date rather than a shared trip-level median.
+            service_date = datetime.fromtimestamp(int(predicted_ts), tz=EASTERN).date()
             scheduled_ts = scheduled_to_ts(scheduled_row["arrival_time"], service_date)
 
             delay = int(predicted_ts) - scheduled_ts
@@ -117,20 +109,25 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
 
 
 def load_stop_times(client, trip_ids: set[str]) -> dict:
-    resp = client.post("/rpc/get_stop_times", json={"req_trip_ids": list(trip_ids)})
-    resp.raise_for_status()
-    rows = resp.json()
-
     cache: dict[str, dict[int, dict]] = {}
-    for row in rows:
-        tid = row["trip_id"]
-        seq = row["stop_sequence"]
-        if tid not in cache:
-            cache[tid] = {}
-        cache[tid][seq] = {
-            "arrival_time": row["arrival_time"],
-            "stop_id": row["stop_id"],
-        }
+    trip_list = list(trip_ids)
+    # PostgREST caps at 1000 rows per response. With ~124 stop_times/trip at most,
+    # batch of 7 trips keeps each response safely under 1000 rows.
+    batch_size = 7
+    for i in range(0, len(trip_list), batch_size):
+        batch = trip_list[i : i + batch_size]
+        resp = client.post("/rpc/get_stop_times", json={"req_trip_ids": batch})
+        resp.raise_for_status()
+        rows = resp.json()
+        for row in rows:
+            tid = row["trip_id"]
+            seq = row["stop_sequence"]
+            if tid not in cache:
+                cache[tid] = {}
+            cache[tid][seq] = {
+                "arrival_time": row["arrival_time"],
+                "stop_id": row["stop_id"],
+            }
     return cache
 
 
