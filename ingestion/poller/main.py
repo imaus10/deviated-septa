@@ -3,75 +3,72 @@ from datetime import datetime, timezone
 
 import poller.gtfs_rt as gtfs_rt
 import poller.gtfs_static as gtfs_static
-from poller.db import get_client, json_dumps
+from poller.db import get_client, get_connection, is_pg
 
 
 def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] starting poll cycle", flush=True)
 
-    client = get_client()
+    conn = None
+    client = None
 
-    # Only import static data once — routes table is small and quick to check.
-    today = datetime.now(timezone.utc).date()
     try:
-        resp = client.get("/routes", params={"select": "route_id", "limit": 1})
-        resp.raise_for_status()
-        static_loaded = len(resp.json()) > 0
+        conn = get_connection()
     except Exception:
-        static_loaded = False
+        pass
 
-    if not static_loaded:
-        print("no static data found; importing GTFS static data", flush=True)
-        gtfs_static.run(client)
+    if conn:
+        db = conn
+        print("  connected via direct Postgres", flush=True)
+    else:
+        client = get_client()
+        db = client
+        print("  connected via Supabase REST API", flush=True)
 
-    print("fetching trip updates...", flush=True)
-    raw = gtfs_rt.fetch_protobuf(gtfs_rt.BUS_TRIP_UPDATES)
-    feed = gtfs_rt.parse_trip_updates(raw)
+    try:
+        if not gtfs_static.is_static_loaded(db):
+            print("no static data found; importing GTFS static data", flush=True)
+            gtfs_static.run(db)
 
-    # Collect unique trip_ids from the feed
-    trip_ids = {
-        e.trip_update.trip.trip_id
-        for e in feed.entity
-        if e.HasField("trip_update")
-        and e.trip_update.trip.schedule_relationship
-        != gtfs_rt.gtfs_realtime_pb2.TripDescriptor.CANCELED
-    }
+        print("fetching trip updates...", flush=True)
+        raw = gtfs_rt.fetch_protobuf(gtfs_rt.BUS_TRIP_UPDATES)
+        feed = gtfs_rt.parse_trip_updates(raw)
 
-    if not trip_ids:
-        print("no active trips in feed", flush=True)
-        client.close()
-        return
+        trip_ids = {
+            e.trip_update.trip.trip_id
+            for e in feed.entity
+            if e.HasField("trip_update")
+            and e.trip_update.trip.schedule_relationship
+            != gtfs_rt.gtfs_realtime_pb2.TripDescriptor.CANCELED
+        }
 
-    print(f"  {len(trip_ids)} active trips in feed", flush=True)
+        if not trip_ids:
+            print("no active trips in feed", flush=True)
+            return
 
-    stop_cache = gtfs_rt.load_stop_times(client, trip_ids)
-    if not stop_cache:
-        print("no matching stop_times found; static data may need refresh", flush=True)
-        client.close()
-        return
+        print(f"  {len(trip_ids)} active trips in feed", flush=True)
 
-    observations = gtfs_rt.extract_observations(feed, stop_cache)
-    print(f"  {len(observations)} observations extracted", flush=True)
+        stop_cache = gtfs_rt.load_stop_times(db, trip_ids)
+        if not stop_cache:
+            print("no matching stop_times found; static data may need refresh", flush=True)
+            return
 
-    if observations:
-        batch = []
-        for obs in observations:
-            batch.append(obs)
-            if len(batch) >= 1000:
-                resp = client.post("/arrival_records", content=json_dumps(batch),
-                                   headers={"Prefer": "return=minimal"})
-                resp.raise_for_status()
-                batch.clear()
-        if batch:
-            resp = client.post("/arrival_records", content=json_dumps(batch),
-                               headers={"Prefer": "return=minimal"})
-            resp.raise_for_status()
+        observations = gtfs_rt.extract_observations(feed, stop_cache)
+        print(f"  {len(observations)} observations extracted", flush=True)
 
-        print("  running aggregations...", flush=True)
-        gtfs_rt.build_aggregations(client)
+        if observations:
+            gtfs_rt.upsert_arrival_records(db, observations)
 
-    print(f"[{datetime.now(timezone.utc).isoformat()}] poll cycle complete", flush=True)
-    client.close()
+            print("  running aggregations...", flush=True)
+            gtfs_rt.build_aggregations(db)
+
+        print(f"[{datetime.now(timezone.utc).isoformat()}] poll cycle complete", flush=True)
+
+    finally:
+        if conn:
+            conn.close()
+        if client:
+            client.close()
 
 
 if __name__ == "__main__":

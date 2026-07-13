@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 import httpx
 from google.transit import gtfs_realtime_pb2
 
+from poller.db import is_pg, json_dumps
+
 BUS_TRIP_UPDATES = "https://www3.septa.org/gtfsrt/septa-pa-us/Trip/rtTripUpdates.pb"
 BUS_VEHICLE_POSITIONS = (
     "https://www3.septa.org/gtfsrt/septa-pa-us/Vehicle/rtVehiclePosition.pb"
@@ -76,9 +78,6 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
             if scheduled_row is None:
                 continue
 
-            # Infer service date from the predicted arrival in Eastern time.
-            # This handles trips that cross midnight correctly — each stop
-            # uses its own date rather than a shared trip-level median.
             service_date = datetime.fromtimestamp(int(predicted_ts), tz=EASTERN).date()
             scheduled_ts = scheduled_to_ts(scheduled_row["arrival_time"], service_date)
 
@@ -108,11 +107,15 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
     return observations
 
 
-def load_stop_times(client, trip_ids: set[str]) -> dict:
+def load_stop_times(db, trip_ids: set[str]) -> dict:
+    if is_pg(db):
+        return _load_stop_times_pg(db, trip_ids)
+    return _load_stop_times_rest(db, trip_ids)
+
+
+def _load_stop_times_rest(client, trip_ids):
     cache: dict[str, dict[int, dict]] = {}
     trip_list = list(trip_ids)
-    # PostgREST caps at 1000 rows per response. With ~124 stop_times/trip at most,
-    # batch of 7 trips keeps each response safely under 1000 rows.
     batch_size = 7
     for i in range(0, len(trip_list), batch_size):
         batch = trip_list[i : i + batch_size]
@@ -131,12 +134,95 @@ def load_stop_times(client, trip_ids: set[str]) -> dict:
     return cache
 
 
-def build_aggregations(client):
-    from datetime import datetime, timezone
+def _load_stop_times_pg(conn, trip_ids):
+    cache: dict[str, dict[int, dict]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT trip_id, stop_sequence, arrival_time, stop_id "
+            "FROM stop_times WHERE trip_id = ANY(%s)",
+            (list(trip_ids),),
+        )
+        for row in cur.fetchall():
+            tid = row[0]
+            seq = row[1]
+            if tid not in cache:
+                cache[tid] = {}
+            cache[tid][seq] = {
+                "arrival_time": row[2],
+                "stop_id": row[3],
+            }
+    return cache
 
+
+def upsert_arrival_records(db, observations):
+    if is_pg(db):
+        _upsert_arrival_records_pg(db, observations)
+    else:
+        _upsert_arrival_records_rest(db, observations)
+
+
+def _upsert_arrival_records_rest(client, observations):
+    batch = []
+    for obs in observations:
+        batch.append(obs)
+        if len(batch) >= 1000:
+            resp = client.post("/arrival_records", content=json_dumps(batch),
+                               headers={"Prefer": "return=minimal"})
+            resp.raise_for_status()
+            batch.clear()
+    if batch:
+        resp = client.post("/arrival_records", content=json_dumps(batch),
+                           headers={"Prefer": "return=minimal"})
+        resp.raise_for_status()
+
+
+def _upsert_arrival_records_pg(conn, observations):
+    cols = [
+        "poll_timestamp", "trip_id", "route_id", "direction_id",
+        "stop_id", "stop_sequence", "scheduled_time", "predicted_time",
+        "delay_seconds", "vehicle_id",
+    ]
+    col_str = ", ".join(cols)
+
+    from poller.db import DatetimeEncoder
+    import json
+
+    def _val(o, c):
+        v = o[c]
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v
+
+    batch = []
+    for obs in observations:
+        batch.append(tuple(_val(obs, c) for c in cols))
+        if len(batch) >= 1000:
+            _insert_arrival_batch(conn, col_str, batch)
+            batch.clear()
+    if batch:
+        _insert_arrival_batch(conn, col_str, batch)
+
+
+def _insert_arrival_batch(conn, col_str, rows):
+    from psycopg2.extras import execute_values
+
+    sql = f"INSERT INTO arrival_records ({col_str}) VALUES %s"
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows)
+    conn.commit()
+
+
+def build_aggregations(db):
     now = datetime.now(timezone.utc)
     today_str = now.date().isoformat()
 
+    if is_pg(db):
+        _build_aggregations_pg(db, today_str, now)
+    else:
+        _build_aggregations_rest(db, today_str, now)
+
+
+def _build_aggregations_rest(client, today_str, now):
     resp = client.post("/rpc/agg_daily", json={"poll_date": today_str})
     resp.raise_for_status()
     print("  daily aggregation done")
@@ -147,4 +233,21 @@ def build_aggregations(client):
 
     resp = client.post("/rpc/agg_snapshot", json={"poll_date": today_str, "now": now.isoformat()})
     resp.raise_for_status()
+    print("  snapshot done")
+
+
+def _build_aggregations_pg(conn, today_str, now):
+    with conn.cursor() as cur:
+        cur.execute("SELECT agg_daily(%s)", [today_str])
+        conn.commit()
+    print("  daily aggregation done")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT agg_hourly(%s)", [today_str])
+        conn.commit()
+    print("  hourly aggregation done")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT agg_snapshot(%s, %s)", [today_str, now.isoformat()])
+        conn.commit()
     print("  snapshot done")

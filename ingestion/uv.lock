@@ -384,6 +384,7 @@ dependencies = [
     { name = "gtfs-realtime-bindings" },
     { name = "httpx" },
     { name = "protobuf" },
+    { name = "psycopg2-binary" },
     { name = "python-dateutil" },
     { name = "python-dotenv" },
 ]
@@ -402,6 +403,7 @@ requires-dist = [
     { name = "gtfs-realtime-bindings", specifier = ">=1.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "protobuf", specifier = ">=4.21" },
+    { name = "psycopg2-binary", specifier = ">=2.9" },
     { name = "psycopg2-binary", marker = "extra == 'dev'", specifier = ">=2.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "python-dateutil", specifier = ">=2.8" },
