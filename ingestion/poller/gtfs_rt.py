@@ -177,6 +177,26 @@ def _upsert_arrival_records_rest(client, observations):
 
 
 def _upsert_arrival_records_pg(conn, observations):
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    for obs in observations:
+        writer.writerow([
+            obs["poll_timestamp"].isoformat(),
+            obs["trip_id"],
+            obs["route_id"],
+            obs["direction_id"],
+            obs["stop_id"],
+            obs["stop_sequence"],
+            obs["scheduled_time"].isoformat(),
+            obs["predicted_time"].isoformat(),
+            obs["delay_seconds"],
+            obs["vehicle_id"] if obs["vehicle_id"] else "",
+        ])
+    buf.seek(0)
+
     cols = [
         "poll_timestamp", "trip_id", "route_id", "direction_id",
         "stop_id", "stop_sequence", "scheduled_time", "predicted_time",
@@ -184,31 +204,8 @@ def _upsert_arrival_records_pg(conn, observations):
     ]
     col_str = ", ".join(cols)
 
-    from poller.db import DatetimeEncoder
-    import json
-
-    def _val(o, c):
-        v = o[c]
-        if isinstance(v, datetime):
-            return v.isoformat()
-        return v
-
-    batch = []
-    for obs in observations:
-        batch.append(tuple(_val(obs, c) for c in cols))
-        if len(batch) >= 1000:
-            _insert_arrival_batch(conn, col_str, batch)
-            batch.clear()
-    if batch:
-        _insert_arrival_batch(conn, col_str, batch)
-
-
-def _insert_arrival_batch(conn, col_str, rows):
-    from psycopg2.extras import execute_values
-
-    sql = f"INSERT INTO arrival_records ({col_str}) VALUES %s"
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows)
+        cur.copy_expert(f"COPY arrival_records ({col_str}) FROM STDIN WITH CSV", buf)
     conn.commit()
 
 
