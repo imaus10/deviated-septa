@@ -95,10 +95,14 @@ crontab -e
 Add:
 
 ```
-* * * * * flock -n /tmp/poller.lock cd /home/pi/deviated-septa/ingestion && uv run python -m poller.main >> /tmp/poller.log 2>&1
+* * * * * flock -n /tmp/poller.lock sh -c 'cd /home/pi/deviated-septa/ingestion && /home/pi/.local/bin/uv run python -m poller.main' >> /tmp/poller.log 2>&1
 ```
 
-`flock -n` skips a cycle if the previous one is still running (safety net in case a poll ever exceeds 60s).
+Notes on the cron command:
+- `flock -n` skips a cycle if the previous one is still running (safety net in case a poll ever exceeds 60s).
+- `sh -c '...'` is needed because `flock` exec's the next argument as a binary, but `cd` is a shell built-in — the shell wrapper makes it work.
+- **Adjust paths** — replace `/home/pi/` with your actual Pi home directory. Run `echo $HOME` to confirm.
+- **Find `uv`** — cron's default PATH doesn't include `~/.local/bin`. Run `which uv` and substitute that absolute path.
 
 ### Monitor
 
