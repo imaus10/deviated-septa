@@ -70,33 +70,34 @@ const lastUpdated = computed(() => {
 
 <style scoped>
 .kpi-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 1rem;
-  margin-bottom: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
 }
 .kpi-card {
-  background: #1a1a2e;
-  border-radius: 8px;
-  padding: 1rem;
+  background: rgba(26, 26, 46, 0.92);
+  border-radius: 6px;
+  padding: 0.4rem 0.75rem;
   text-align: center;
+  backdrop-filter: blur(4px);
+  min-width: 120px;
 }
 .kpi-value {
   display: block;
-  font-size: 1.8rem;
+  font-size: 1.2rem;
   font-weight: 700;
   color: #e0e0e0;
 }
 .kpi-label {
   display: block;
-  font-size: 0.8rem;
+  font-size: 0.65rem;
   color: #888;
-  margin-top: 0.25rem;
+  margin-top: 0.1rem;
 }
 .updated-at {
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   color: #666;
-  text-align: right;
-  margin-bottom: 1rem;
+  margin-top: 0.35rem;
+  text-align: left;
 }
 </style>

@@ -47,6 +47,12 @@ function formatDelay(seconds) {
   return `${sign}${m}m ${s}s`;
 }
 
+function typeLabel(route_type) {
+  if (route_type === 0) return "T";
+  if (route_type === 3) return "B";
+  return "—";
+}
+
 function otpColor(pct) {
   if (pct == null) return "#555";
   if (pct >= 85) return "#4caf50";
@@ -59,18 +65,20 @@ function otpColor(pct) {
   <table class="route-table">
     <thead>
       <tr>
+        <th class="sortable" @click="setSort('route_type')">#{{ sortIcon('route_type') }}</th>
         <th class="sortable" @click="setSort('route_id')">Route{{ sortIcon('route_id') }}</th>
         <th class="sortable" @click="setSort('route_name')">Name{{ sortIcon('route_name') }}</th>
         <th class="sortable" @click="setSort('total_observations')">Obs{{ sortIcon('total_observations') }}</th>
-        <th class="sortable" @click="setSort('on_time_count')">On-Time{{ sortIcon('on_time_count') }}</th>
+        <th class="sortable" @click="setSort('on_time_count')">OT{{ sortIcon('on_time_count') }}</th>
         <th class="sortable" @click="setSort('early_count')">Early{{ sortIcon('early_count') }}</th>
         <th class="sortable" @click="setSort('late_count')">Late{{ sortIcon('late_count') }}</th>
         <th class="sortable" @click="setSort('on_time_percentage')">OTP%{{ sortIcon('on_time_percentage') }}</th>
-        <th class="sortable" @click="setSort('avg_delay_seconds')">Avg Delay{{ sortIcon('avg_delay_seconds') }}</th>
+        <th class="sortable" @click="setSort('avg_delay_seconds')">Delay{{ sortIcon('avg_delay_seconds') }}</th>
       </tr>
     </thead>
     <tbody>
       <tr v-for="r in sorted" :key="r.route_id">
+        <td class="type-cell">{{ typeLabel(r.route_type) }}</td>
         <td class="route-id">{{ r.route_id }}</td>
         <td class="route-name">{{ r.route_name ?? "—" }}</td>
         <td>{{ (r.total_observations ?? 0).toLocaleString() }}</td>
@@ -96,14 +104,15 @@ function otpColor(pct) {
 .route-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.85rem;
+  font-size: 0.78rem;
 }
 th {
   text-align: left;
-  padding: 0.5rem;
+  padding: 0.35rem 0.4rem;
   color: #888;
   border-bottom: 1px solid #333;
   font-weight: 600;
+  white-space: nowrap;
 }
 th.sortable {
   cursor: pointer;
@@ -113,7 +122,7 @@ th.sortable:hover {
   color: #ccc;
 }
 td {
-  padding: 0.5rem;
+  padding: 0.3rem 0.4rem;
   border-bottom: 1px solid #222;
 }
 .route-id {
@@ -122,6 +131,11 @@ td {
 }
 .route-name {
   color: #aaa;
+}
+.type-cell {
+  color: #666;
+  font-size: 0.7rem;
+  text-align: center;
 }
 .otp-bar-container {
   display: flex;
