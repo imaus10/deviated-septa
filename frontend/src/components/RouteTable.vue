@@ -1,9 +1,41 @@
 <script setup>
-import { computed } from "vue";
+import { ref, computed } from "vue";
 
 const props = defineProps({
   routes: { type: Array, required: true },
 });
+
+const sortKey = ref("on_time_percentage");
+const sortDir = ref("asc");
+
+function setSort(key) {
+  if (sortKey.value === key) {
+    sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
+  } else {
+    sortKey.value = key;
+    sortDir.value = "asc";
+  }
+}
+
+function sortVal(r, key) {
+  const v = r[key];
+  if (key === "route_id") return v ?? "";
+  if (key === "route_name") return (v ?? "").toLowerCase();
+  return v ?? 0;
+}
+
+const sorted = computed(() =>
+  [...props.routes].sort((a, b) => {
+    const va = sortVal(a, sortKey.value);
+    const vb = sortVal(b, sortKey.value);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * (sortDir.value === "asc" ? 1 : -1);
+  }),
+);
+
+function sortIcon(key) {
+  if (sortKey.value !== key) return "";
+  return sortDir.value === "asc" ? " ▲" : " ▼";
+}
 
 function formatDelay(seconds) {
   if (seconds == null) return "—";
@@ -14,10 +46,6 @@ function formatDelay(seconds) {
   if (m === 0) return `${sign}${s}s`;
   return `${sign}${m}m ${s}s`;
 }
-
-const sorted = computed(() =>
-  [...props.routes].sort((a, b) => (a.on_time_percentage ?? 0) - (b.on_time_percentage ?? 0)),
-);
 
 function otpColor(pct) {
   if (pct == null) return "#555";
@@ -31,14 +59,14 @@ function otpColor(pct) {
   <table class="route-table">
     <thead>
       <tr>
-        <th>Route</th>
-        <th>Name</th>
-        <th>Obs</th>
-        <th>On-Time</th>
-        <th>Early</th>
-        <th>Late</th>
-        <th>OTP%</th>
-        <th>Avg Delay</th>
+        <th class="sortable" @click="setSort('route_id')">Route{{ sortIcon('route_id') }}</th>
+        <th class="sortable" @click="setSort('route_name')">Name{{ sortIcon('route_name') }}</th>
+        <th class="sortable" @click="setSort('total_observations')">Obs{{ sortIcon('total_observations') }}</th>
+        <th class="sortable" @click="setSort('on_time_count')">On-Time{{ sortIcon('on_time_count') }}</th>
+        <th class="sortable" @click="setSort('early_count')">Early{{ sortIcon('early_count') }}</th>
+        <th class="sortable" @click="setSort('late_count')">Late{{ sortIcon('late_count') }}</th>
+        <th class="sortable" @click="setSort('on_time_percentage')">OTP%{{ sortIcon('on_time_percentage') }}</th>
+        <th class="sortable" @click="setSort('avg_delay_seconds')">Avg Delay{{ sortIcon('avg_delay_seconds') }}</th>
       </tr>
     </thead>
     <tbody>
@@ -76,6 +104,13 @@ th {
   color: #888;
   border-bottom: 1px solid #333;
   font-weight: 600;
+}
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+th.sortable:hover {
+  color: #ccc;
 }
 td {
   padding: 0.5rem;
