@@ -177,25 +177,7 @@ def _upsert_arrival_records_rest(client, observations):
 
 
 def _upsert_arrival_records_pg(conn, observations):
-    import csv
-    import io
-
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    for obs in observations:
-        writer.writerow([
-            obs["poll_timestamp"].isoformat(),
-            obs["trip_id"],
-            obs["route_id"],
-            obs["direction_id"],
-            obs["stop_id"],
-            obs["stop_sequence"],
-            obs["scheduled_time"].isoformat(),
-            obs["predicted_time"].isoformat(),
-            obs["delay_seconds"],
-            obs["vehicle_id"] if obs["vehicle_id"] else "",
-        ])
-    buf.seek(0)
+    from psycopg2.extras import execute_values
 
     cols = [
         "poll_timestamp", "trip_id", "route_id", "direction_id",
@@ -203,9 +185,30 @@ def _upsert_arrival_records_pg(conn, observations):
         "delay_seconds", "vehicle_id",
     ]
     col_str = ", ".join(cols)
+    pk_cols = ["trip_id", "stop_sequence"]
+    update_cols = [c for c in cols if c not in pk_cols]
+    update_str = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
+
+    values = [[
+        obs["poll_timestamp"],
+        obs["trip_id"],
+        obs["route_id"],
+        obs["direction_id"],
+        obs["stop_id"],
+        obs["stop_sequence"],
+        obs["scheduled_time"],
+        obs["predicted_time"],
+        obs["delay_seconds"],
+        obs["vehicle_id"] if obs["vehicle_id"] else None,
+    ] for obs in observations]
+
+    sql = (
+        f"INSERT INTO arrival_records ({col_str}) VALUES %s "
+        f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {update_str}"
+    )
 
     with conn.cursor() as cur:
-        cur.copy_expert(f"COPY arrival_records ({col_str}) FROM STDIN WITH CSV", buf)
+        execute_values(cur, sql, values, page_size=1000)
     conn.commit()
 
 

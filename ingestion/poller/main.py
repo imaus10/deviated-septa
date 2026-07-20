@@ -34,9 +34,10 @@ def main():
 
     try:
         t1 = time.perf_counter()
-        if not gtfs_static.is_static_loaded(db):
-            print("no static data found; importing GTFS static data", flush=True)
-            gtfs_static.run(db)
+        last_modified = gtfs_static.get_freshness()
+        if last_modified != gtfs_static.get_stored_freshness(db):
+            print("static data updated; re-importing", flush=True)
+            gtfs_static.run_and_record_freshness(db)
         _log_time("static check", time.perf_counter() - t1)
 
         t2 = time.perf_counter()

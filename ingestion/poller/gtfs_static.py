@@ -1,18 +1,21 @@
 import csv
 import io
+import time
 import zipfile
+from datetime import datetime, timezone
 
 import httpx
 
-from poller.db import get_client, is_pg, json_dumps, upsert_table
+from poller.db import copy_upsert, get_client, is_pg, json_dumps, upsert_table
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
 
 
 def download_zip() -> bytes:
-    resp = httpx.get(GTFS_URL, follow_redirects=True, timeout=60)
-    resp.raise_for_status()
-    return resp.content
+    with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+        resp = client.get(GTFS_URL, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
 
 
 def parse_csv(raw: str) -> list[dict[str, str]]:
@@ -134,12 +137,12 @@ def _prep_stop_times(rows):
 
 def import_stop_times(db, rows):
     prep = _prep_stop_times(rows)
-    if is_pg(db):
-        upsert_table(db, "stop_times", prep, pk_cols=["trip_id", "stop_sequence"])
-        return len(prep)
-    batch = []
     total = len(prep)
+    if is_pg(db):
+        copy_upsert(db, "stop_times", prep, pk_cols=["trip_id", "stop_sequence"])
+        return total
     last_pct = 0
+    batch = []
     for r in prep:
         batch.append(r)
         if len(batch) >= 2000:
@@ -155,7 +158,7 @@ def import_stop_times(db, rows):
         resp = db.post("/stop_times", content=json_dumps(batch),
                        headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
         resp.raise_for_status()
-    return len(prep)
+    return total
 
 
 def _prep_calendar(rows):
@@ -198,10 +201,10 @@ def import_calendar(db, rows):
 
 IMPORT_FUNCS = {
     "routes.txt": import_routes,
+    "calendar.txt": import_calendar,
     "trips.txt": import_trips,
     "stops.txt": import_stops,
     "stop_times.txt": import_stop_times,
-    "calendar.txt": import_calendar,
 }
 
 
@@ -215,9 +218,47 @@ def is_static_loaded(db):
     return len(resp.json()) > 0
 
 
+def get_freshness() -> str:
+    with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+        resp = client.head(GTFS_URL, follow_redirects=True)
+        resp.raise_for_status()
+    lm = resp.headers.get("last-modified")
+    if not lm:
+        raise ValueError("SEPTA GTFS feed missing Last-Modified header")
+    return lm
+
+
+def get_stored_freshness(db) -> str | None:
+    if is_pg(db):
+        with db.cursor() as cur:
+            cur.execute("SELECT last_modified FROM static_feed_meta ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            return row[0] if row else None
+    else:
+        resp = db.get("/static_feed_meta", params={"select": "last_modified", "order": "id.desc", "limit": 1})
+        resp.raise_for_status()
+        rows = resp.json()
+        return rows[0]["last_modified"] if rows else None
+
+
+def update_freshness(db, last_modified: str | None):
+    if is_pg(db):
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO static_feed_meta (last_modified, checked_at) VALUES (%s, NOW())",
+                (last_modified,),
+            )
+            db.commit()
+    else:
+        db.post("/static_feed_meta", content=json_dumps({
+            "last_modified": last_modified,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }), headers={"Prefer": "return=minimal"})
+
+
 def run(db, gtfs_zip=None):
     if gtfs_zip is None:
-        print("Downloading GTFS static data from SEPTA...")
+        print("Downloading GTFS static data from SEPTA...", flush=True)
         gtfs_zip = download_zip()
 
     counts = {}
@@ -227,12 +268,20 @@ def run(db, gtfs_zip=None):
         with zipfile.ZipFile(io.BytesIO(inner_raw)) as z:
             for filename, func in IMPORT_FUNCS.items():
                 if filename not in z.namelist():
-                    print(f"  skipping {filename} (not in zip)")
+                    print(f"  skipping {filename} (not in zip)", flush=True)
                     continue
+                t0 = time.perf_counter()
                 raw = z.read(filename).decode("utf-8-sig")
                 rows = parse_csv(raw)
                 n = func(db, rows)
                 counts[filename] = n
-                print(f"  imported {n} rows from {filename}")
+                print(f"  imported {n} rows from {filename} in {time.perf_counter() - t0:.1f}s", flush=True)
 
+    return counts
+
+
+def run_and_record_freshness(db, gtfs_zip=None):
+    counts = run(db, gtfs_zip)
+    last_modified = get_freshness()
+    update_freshness(db, last_modified)
     return counts
