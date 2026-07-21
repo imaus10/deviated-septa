@@ -231,11 +231,11 @@ def get_freshness() -> str:
 def get_stored_freshness(db) -> str | None:
     if is_pg(db):
         with db.cursor() as cur:
-            cur.execute("SELECT last_modified FROM static_feed_meta ORDER BY id DESC LIMIT 1")
+            cur.execute("SELECT last_modified FROM service_cycle ORDER BY id DESC LIMIT 1")
             row = cur.fetchone()
             return row[0] if row else None
     else:
-        resp = db.get("/static_feed_meta", params={"select": "last_modified", "order": "id.desc", "limit": 1})
+        resp = db.get("/service_cycle", params={"select": "last_modified", "order": "id.desc", "limit": 1})
         resp.raise_for_status()
         rows = resp.json()
         return rows[0]["last_modified"] if rows else None
@@ -245,12 +245,12 @@ def update_freshness(db, last_modified: str | None):
     if is_pg(db):
         with db.cursor() as cur:
             cur.execute(
-                "INSERT INTO static_feed_meta (last_modified, checked_at) VALUES (%s, NOW())",
+                "INSERT INTO service_cycle (last_modified, checked_at) VALUES (%s, NOW())",
                 (last_modified,),
             )
             db.commit()
     else:
-        db.post("/static_feed_meta", content=json_dumps({
+        db.post("/service_cycle", content=json_dumps({
             "last_modified": last_modified,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }), headers={"Prefer": "return=minimal"})

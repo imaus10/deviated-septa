@@ -74,8 +74,8 @@ def main():
 
         if observations:
             t5 = time.perf_counter()
-            gtfs_rt.upsert_arrival_records(db, observations)
-            _log_time("insert arrival_records", time.perf_counter() - t5)
+            gtfs_rt.update_predictions(db, observations)
+            _log_time("update predictions", time.perf_counter() - t5)
 
             t6 = time.perf_counter()
             print("  running aggregations...", flush=True)

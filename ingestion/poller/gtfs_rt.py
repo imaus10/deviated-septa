@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -5,6 +6,8 @@ import httpx
 from google.transit import gtfs_realtime_pb2
 
 from poller.db import is_pg, json_dumps
+
+log = logging.getLogger(__name__)
 
 BUS_TRIP_UPDATES = "https://www3.septa.org/gtfsrt/septa-pa-us/Trip/rtTripUpdates.pb"
 BUS_VEHICLE_POSITIONS = (
@@ -54,8 +57,6 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
 
         tu = entity.trip_update
         trip_id = tu.trip.trip_id
-        route_id = tu.trip.route_id
-        direction_id = tu.trip.direction_id
 
         if tu.trip.schedule_relationship == gtfs_realtime_pb2.TripDescriptor.CANCELED:
             continue
@@ -72,35 +73,34 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
 
             stop_seq = stu.stop_sequence
             predicted_ts = stu.arrival.time
-            stop_id = stu.stop_id
 
             scheduled_row = stop_times.get(stop_seq)
             if scheduled_row is None:
                 continue
 
+            arrival = scheduled_row.get("arrival_time")
+            if not arrival:
+                log.warning("skip trip=%s seq=%s: empty arrival_time", trip_id, stop_seq)
+                continue
+
             service_date = datetime.fromtimestamp(int(predicted_ts), tz=EASTERN).date()
-            scheduled_ts = scheduled_to_ts(scheduled_row["arrival_time"], service_date)
+            scheduled_ts = scheduled_to_ts(arrival, service_date)
 
             delay = int(predicted_ts) - scheduled_ts
 
             observations.append(
                 {
-                    "poll_timestamp": datetime.fromtimestamp(
-                        feed.header.timestamp, tz=timezone.utc
-                    ),
                     "trip_id": trip_id,
-                    "route_id": route_id,
-                    "direction_id": direction_id,
-                    "stop_id": stop_id,
                     "stop_sequence": stop_seq,
-                    "scheduled_time": datetime.fromtimestamp(
-                        scheduled_ts, tz=timezone.utc
-                    ),
                     "predicted_time": datetime.fromtimestamp(
                         int(predicted_ts), tz=timezone.utc
                     ),
                     "delay_seconds": delay,
                     "vehicle_id": vehicle_id,
+                    "poll_timestamp": datetime.fromtimestamp(
+                        feed.header.timestamp, tz=timezone.utc
+                    ),
+                    "service_date": service_date,
                 }
             )
 
@@ -154,61 +154,75 @@ def _load_stop_times_pg(conn, trip_ids):
     return cache
 
 
-def upsert_arrival_records(db, observations):
+def update_predictions(db, observations):
     if is_pg(db):
-        _upsert_arrival_records_pg(db, observations)
+        _update_predictions_pg(db, observations)
     else:
-        _upsert_arrival_records_rest(db, observations)
+        _update_predictions_rest(db, observations)
 
 
-def _upsert_arrival_records_rest(client, observations):
+def _update_predictions_rest(client, observations):
     batch = []
     for obs in observations:
         batch.append(obs)
         if len(batch) >= 1000:
-            resp = client.post("/arrival_records", content=json_dumps(batch),
-                               headers={"Prefer": "return=minimal"})
+            resp = client.post("/real_time_observations", content=json_dumps(batch),
+                               headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
             resp.raise_for_status()
             batch.clear()
     if batch:
-        resp = client.post("/arrival_records", content=json_dumps(batch),
-                           headers={"Prefer": "return=minimal"})
+        resp = client.post("/real_time_observations", content=json_dumps(batch),
+                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
         resp.raise_for_status()
 
 
-def _upsert_arrival_records_pg(conn, observations):
-    from psycopg2.extras import execute_values
+def _update_predictions_pg(conn, observations):
+    import io
 
     cols = [
-        "poll_timestamp", "trip_id", "route_id", "direction_id",
-        "stop_id", "stop_sequence", "scheduled_time", "predicted_time",
-        "delay_seconds", "vehicle_id",
+        "trip_id", "stop_sequence",
+        "predicted_time", "delay_seconds", "vehicle_id", "poll_timestamp",
+        "service_date",
     ]
-    col_str = ", ".join(cols)
-    pk_cols = ["trip_id", "stop_sequence"]
-    update_cols = [c for c in cols if c not in pk_cols]
-    update_str = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
 
-    values = [[
-        obs["poll_timestamp"],
-        obs["trip_id"],
-        obs["route_id"],
-        obs["direction_id"],
-        obs["stop_id"],
-        obs["stop_sequence"],
-        obs["scheduled_time"],
-        obs["predicted_time"],
-        obs["delay_seconds"],
-        obs["vehicle_id"] if obs["vehicle_id"] else None,
-    ] for obs in observations]
-
-    sql = (
-        f"INSERT INTO arrival_records ({col_str}) VALUES %s "
-        f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {update_str}"
-    )
+    buf = io.StringIO()
+    for obs in observations:
+        row = [
+            str(obs["trip_id"]),
+            str(obs["stop_sequence"]),
+            obs["predicted_time"].isoformat() if obs["predicted_time"] else "\\N",
+            str(obs["delay_seconds"]) if obs["delay_seconds"] is not None else "\\N",
+            str(obs["vehicle_id"]) if obs["vehicle_id"] else "\\N",
+            obs["poll_timestamp"].isoformat() if obs["poll_timestamp"] else "\\N",
+            str(obs["service_date"]) if obs["service_date"] else "\\N",
+        ]
+        buf.write("\t".join(row) + "\n")
+    buf.seek(0)
 
     with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=1000)
+        cur.execute(
+            "CREATE TEMP TABLE _pred_staging ("
+            "trip_id text, stop_sequence int, "
+            "predicted_time timestamptz, delay_seconds int, "
+            "vehicle_id text, poll_timestamp timestamptz, "
+            "service_date date"
+            ") ON COMMIT DROP"
+        )
+        cur.copy_from(buf, "_pred_staging", sep="\t", null="\\N", columns=cols)
+        cur.execute(
+            "INSERT INTO real_time_observations "
+            "    (trip_id, stop_sequence, predicted_time, delay_seconds, "
+            "     vehicle_id, poll_timestamp, service_date) "
+            "SELECT trip_id, stop_sequence, predicted_time, delay_seconds, "
+            "       vehicle_id, poll_timestamp, service_date "
+            "FROM _pred_staging "
+            "ON CONFLICT (trip_id, stop_sequence, service_date) "
+            "DO UPDATE SET "
+            "    predicted_time = EXCLUDED.predicted_time, "
+            "    delay_seconds  = EXCLUDED.delay_seconds, "
+            "    vehicle_id     = EXCLUDED.vehicle_id, "
+            "    poll_timestamp = EXCLUDED.poll_timestamp"
+        )
     conn.commit()
 
 

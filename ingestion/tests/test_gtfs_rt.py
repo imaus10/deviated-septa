@@ -83,10 +83,10 @@ def test_extract_observations_basic():
     obs = extract_observations(feed, cache)
     assert len(obs) == 2
     assert obs[0]["trip_id"] == "t1"
-    assert obs[0]["route_id"] == "42"
-    assert obs[0]["stop_id"] == "A"
+    assert obs[0]["stop_sequence"] == 1
     assert obs[0]["delay_seconds"] == 60  # predicted 17:41 vs scheduled 17:40
     assert abs(obs[1]["delay_seconds"]) <= 1  # predicted 17:42 vs scheduled 17:42
+    assert obs[0]["service_date"] == date(2026, 7, 6)
 
 
 def test_extract_observations_cancelled():

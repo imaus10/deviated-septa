@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, BigInteger, Float, Text, Date, DateTime, ForeignKey,
+    Column, Integer, BigInteger, Float, Text, Date, ForeignKey,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import TIMESTAMP
@@ -21,8 +21,8 @@ class Trip(Base):
     __tablename__ = "trips"
 
     trip_id = Column(Text, primary_key=True)
-    route_id = Column(Text, ForeignKey("routes.route_id"), nullable=False, index=True)
-    service_id = Column(Text, nullable=False, index=True)
+    route_id = Column(Text, ForeignKey("routes.route_id"), nullable=False)
+    service_id = Column(Text, nullable=False)
     direction_id = Column(Integer, nullable=False)
     trip_headsign = Column(Text, nullable=True)
 
@@ -41,7 +41,7 @@ class StopTime(Base):
 
     trip_id = Column(Text, ForeignKey("trips.trip_id"), primary_key=True)
     stop_sequence = Column(Integer, primary_key=True)
-    stop_id = Column(Text, ForeignKey("stops.stop_id"), nullable=False, index=True)
+    stop_id = Column(Text, ForeignKey("stops.stop_id"), nullable=False)
     arrival_time = Column(Text, nullable=True)
     departure_time = Column(Text, nullable=True)
     pickup_type = Column(Integer, nullable=True)
@@ -63,22 +63,30 @@ class Calendar(Base):
     end_date = Column(Text, nullable=False)
 
 
-class ArrivalRecord(Base):
-    __tablename__ = "arrival_records"
+class ServiceCycle(Base):
+    __tablename__ = "service_cycle"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    last_modified = Column(Text, nullable=True)
+    checked_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class RealTimeObservation(Base):
+    __tablename__ = "real_time_observations"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    poll_timestamp = Column(TIMESTAMP(timezone=True), nullable=False, index=True)
-    trip_id = Column(Text, ForeignKey("trips.trip_id"), nullable=False)
-    route_id = Column(Text, ForeignKey("routes.route_id"), nullable=False, index=True)
-    direction_id = Column(Integer, nullable=False)
-    stop_id = Column(Text, ForeignKey("stops.stop_id"), nullable=False)
+    trip_id = Column(Text, nullable=False)
     stop_sequence = Column(Integer, nullable=False)
-    scheduled_time = Column(TIMESTAMP(timezone=True), nullable=True)
-    predicted_time = Column(TIMESTAMP(timezone=True), nullable=True)
-    delay_seconds = Column(Integer, nullable=True)
+    predicted_time = Column(TIMESTAMP(timezone=True), nullable=False)
+    delay_seconds = Column(Integer, nullable=False)
     vehicle_id = Column(Text, nullable=True)
+    poll_timestamp = Column(TIMESTAMP(timezone=True), nullable=False)
+    service_date = Column(Date, nullable=False)
 
-    __table_args__ = ()
+    __table_args__ = (
+        UniqueConstraint("trip_id", "stop_sequence", "service_date",
+                         name="uq_obs_trip_stop_date"),
+    )
 
 
 class DailyRouteMetric(Base):
@@ -131,11 +139,3 @@ class LatestSnapshot(Base):
     on_time_percentage = Column(Float, nullable=True)
     avg_delay_seconds = Column(Float, nullable=True)
     updated_at = Column(TIMESTAMP(timezone=True), nullable=True)
-
-
-class StaticFeedMeta(Base):
-    __tablename__ = "static_feed_meta"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    last_modified = Column(Text, nullable=True)
-    checked_at = Column(TIMESTAMP(timezone=True), nullable=False)
