@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from poller.db import copy_upsert, get_client, is_pg, json_dumps, upsert_table
+from poller.db import copy_upsert, upsert_table
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
 
@@ -37,21 +37,7 @@ def _prep_routes(rows):
 
 def import_routes(db, rows):
     prep = _prep_routes(rows)
-    if is_pg(db):
-        upsert_table(db, "routes", prep, pk_cols=["route_id"])
-        return len(prep)
-    batch = []
-    for r in prep:
-        batch.append(r)
-        if len(batch) >= 500:
-            resp = db.post("/routes", content=json_dumps(batch),
-                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-            resp.raise_for_status()
-            batch.clear()
-    if batch:
-        resp = db.post("/routes", content=json_dumps(batch),
-                       headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-        resp.raise_for_status()
+    upsert_table(db, "routes", prep, pk_cols=["route_id"])
     return len(prep)
 
 
@@ -70,21 +56,7 @@ def _prep_trips(rows):
 
 def import_trips(db, rows):
     prep = _prep_trips(rows)
-    if is_pg(db):
-        upsert_table(db, "trips", prep, pk_cols=["trip_id"])
-        return len(prep)
-    batch = []
-    for r in prep:
-        batch.append(r)
-        if len(batch) >= 2000:
-            resp = db.post("/trips", content=json_dumps(batch),
-                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-            resp.raise_for_status()
-            batch.clear()
-    if batch:
-        resp = db.post("/trips", content=json_dumps(batch),
-                       headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-        resp.raise_for_status()
+    upsert_table(db, "trips", prep, pk_cols=["trip_id"])
     return len(prep)
 
 
@@ -102,21 +74,7 @@ def _prep_stops(rows):
 
 def import_stops(db, rows):
     prep = _prep_stops(rows)
-    if is_pg(db):
-        upsert_table(db, "stops", prep, pk_cols=["stop_id"])
-        return len(prep)
-    batch = []
-    for r in prep:
-        batch.append(r)
-        if len(batch) >= 500:
-            resp = db.post("/stops", content=json_dumps(batch),
-                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-            resp.raise_for_status()
-            batch.clear()
-    if batch:
-        resp = db.post("/stops", content=json_dumps(batch),
-                       headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-        resp.raise_for_status()
+    upsert_table(db, "stops", prep, pk_cols=["stop_id"])
     return len(prep)
 
 
@@ -137,28 +95,8 @@ def _prep_stop_times(rows):
 
 def import_stop_times(db, rows):
     prep = _prep_stop_times(rows)
-    total = len(prep)
-    if is_pg(db):
-        copy_upsert(db, "stop_times", prep, pk_cols=["trip_id", "stop_sequence"])
-        return total
-    last_pct = 0
-    batch = []
-    for r in prep:
-        batch.append(r)
-        if len(batch) >= 2000:
-            resp = db.post("/stop_times", content=json_dumps(batch),
-                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-            resp.raise_for_status()
-            pct = (total - len(batch)) * 100 // total
-            if pct >= last_pct + 10:
-                print(f"  stop_times: {total - len(batch)}/{total} ({pct}%)", flush=True)
-                last_pct = pct
-            batch.clear()
-    if batch:
-        resp = db.post("/stop_times", content=json_dumps(batch),
-                       headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-        resp.raise_for_status()
-    return total
+    copy_upsert(db, "stop_times", prep, pk_cols=["trip_id", "stop_sequence"])
+    return len(prep)
 
 
 def _prep_calendar(rows):
@@ -181,21 +119,7 @@ def _prep_calendar(rows):
 
 def import_calendar(db, rows):
     prep = _prep_calendar(rows)
-    if is_pg(db):
-        upsert_table(db, "calendar", prep, pk_cols=["service_id"])
-        return len(prep)
-    batch = []
-    for r in prep:
-        batch.append(r)
-        if len(batch) >= 500:
-            resp = db.post("/calendar", content=json_dumps(batch),
-                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-            resp.raise_for_status()
-            batch.clear()
-    if batch:
-        resp = db.post("/calendar", content=json_dumps(batch),
-                       headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-        resp.raise_for_status()
+    upsert_table(db, "calendar", prep, pk_cols=["service_id"])
     return len(prep)
 
 
@@ -209,13 +133,9 @@ IMPORT_FUNCS = {
 
 
 def is_static_loaded(db):
-    if is_pg(db):
-        with db.cursor() as cur:
-            cur.execute("SELECT route_id FROM routes LIMIT 1")
-            return cur.fetchone() is not None
-    resp = db.get("/routes", params={"select": "route_id", "limit": 1})
-    resp.raise_for_status()
-    return len(resp.json()) > 0
+    with db.cursor() as cur:
+        cur.execute("SELECT route_id FROM routes LIMIT 1")
+        return cur.fetchone() is not None
 
 
 def get_freshness() -> str:
@@ -229,31 +149,19 @@ def get_freshness() -> str:
 
 
 def get_stored_freshness(db) -> str | None:
-    if is_pg(db):
-        with db.cursor() as cur:
-            cur.execute("SELECT last_modified FROM service_cycle ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            return row[0] if row else None
-    else:
-        resp = db.get("/service_cycle", params={"select": "last_modified", "order": "id.desc", "limit": 1})
-        resp.raise_for_status()
-        rows = resp.json()
-        return rows[0]["last_modified"] if rows else None
+    with db.cursor() as cur:
+        cur.execute("SELECT last_modified FROM service_cycle ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 def update_freshness(db, last_modified: str | None):
-    if is_pg(db):
-        with db.cursor() as cur:
-            cur.execute(
-                "INSERT INTO service_cycle (last_modified, checked_at) VALUES (%s, NOW())",
-                (last_modified,),
-            )
-            db.commit()
-    else:
-        db.post("/service_cycle", content=json_dumps({
-            "last_modified": last_modified,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }), headers={"Prefer": "return=minimal"})
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_cycle (last_modified, checked_at) VALUES (%s, NOW())",
+            (last_modified,),
+        )
+        db.commit()
 
 
 def run(db, gtfs_zip=None):

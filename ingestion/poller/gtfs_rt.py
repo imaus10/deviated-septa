@@ -1,11 +1,10 @@
+import io
 import logging
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
 from google.transit import gtfs_realtime_pb2
-
-from poller.db import is_pg, json_dumps
 
 log = logging.getLogger(__name__)
 
@@ -107,34 +106,7 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
     return observations
 
 
-def load_stop_times(db, trip_ids: set[str]) -> dict:
-    if is_pg(db):
-        return _load_stop_times_pg(db, trip_ids)
-    return _load_stop_times_rest(db, trip_ids)
-
-
-def _load_stop_times_rest(client, trip_ids):
-    cache: dict[str, dict[int, dict]] = {}
-    trip_list = list(trip_ids)
-    batch_size = 7
-    for i in range(0, len(trip_list), batch_size):
-        batch = trip_list[i : i + batch_size]
-        resp = client.post("/rpc/get_stop_times", json={"req_trip_ids": batch})
-        resp.raise_for_status()
-        rows = resp.json()
-        for row in rows:
-            tid = row["trip_id"]
-            seq = row["stop_sequence"]
-            if tid not in cache:
-                cache[tid] = {}
-            cache[tid][seq] = {
-                "arrival_time": row["arrival_time"],
-                "stop_id": row["stop_id"],
-            }
-    return cache
-
-
-def _load_stop_times_pg(conn, trip_ids):
+def load_stop_times(conn, trip_ids: set[str]) -> dict:
     cache: dict[str, dict[int, dict]] = {}
     with conn.cursor() as cur:
         cur.execute(
@@ -154,31 +126,7 @@ def _load_stop_times_pg(conn, trip_ids):
     return cache
 
 
-def update_predictions(db, observations):
-    if is_pg(db):
-        _update_predictions_pg(db, observations)
-    else:
-        _update_predictions_rest(db, observations)
-
-
-def _update_predictions_rest(client, observations):
-    batch = []
-    for obs in observations:
-        batch.append(obs)
-        if len(batch) >= 1000:
-            resp = client.post("/real_time_observations", content=json_dumps(batch),
-                               headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-            resp.raise_for_status()
-            batch.clear()
-    if batch:
-        resp = client.post("/real_time_observations", content=json_dumps(batch),
-                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
-        resp.raise_for_status()
-
-
-def _update_predictions_pg(conn, observations):
-    import io
-
+def update_predictions(conn, observations):
     cols = [
         "trip_id", "stop_sequence",
         "predicted_time", "delay_seconds", "vehicle_id", "poll_timestamp",
@@ -226,31 +174,10 @@ def _update_predictions_pg(conn, observations):
     conn.commit()
 
 
-def build_aggregations(db):
+def build_aggregations(conn):
     now = datetime.now(timezone.utc)
     today_str = now.date().isoformat()
 
-    if is_pg(db):
-        _build_aggregations_pg(db, today_str, now)
-    else:
-        _build_aggregations_rest(db, today_str, now)
-
-
-def _build_aggregations_rest(client, today_str, now):
-    resp = client.post("/rpc/agg_daily", json={"poll_date": today_str})
-    resp.raise_for_status()
-    print("  daily aggregation done")
-
-    resp = client.post("/rpc/agg_hourly", json={"poll_date": today_str})
-    resp.raise_for_status()
-    print("  hourly aggregation done")
-
-    resp = client.post("/rpc/agg_snapshot", json={"poll_date": today_str, "now": now.isoformat()})
-    resp.raise_for_status()
-    print("  snapshot done")
-
-
-def _build_aggregations_pg(conn, today_str, now):
     with conn.cursor() as cur:
         cur.execute("SELECT agg_daily(%s)", [today_str])
         conn.commit()
