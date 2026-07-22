@@ -1,45 +1,33 @@
 import { ref, onMounted, onUnmounted } from "vue";
-import { supabase } from "../lib/supabase.js";
+import { sql } from "../lib/neon.js";
+
+const POLL_INTERVAL = 60_000;
 
 export function useDashboardData() {
   const snapshot = ref([]);
   const loading = ref(true);
   const error = ref(null);
 
-  let subscription = null;
+  let timer = null;
 
   async function fetchSnapshot() {
-    const { data, error: err } = await supabase
-      .from("latest_snapshot")
-      .select("*")
-      .order("route_id");
-
-    if (err) {
-      error.value = err.message;
-      return;
+    try {
+      const rows = await sql`SELECT * FROM latest_snapshot ORDER BY route_id`;
+      snapshot.value = rows;
+      loading.value = false;
+      error.value = null;
+    } catch (e) {
+      error.value = e.message;
     }
-    snapshot.value = data;
-    loading.value = false;
-  }
-
-  function subscribeToChanges() {
-    subscription = supabase
-      .channel("latest_snapshot_changes")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "latest_snapshot" },
-        () => fetchSnapshot(),
-      )
-      .subscribe();
   }
 
   onMounted(() => {
     fetchSnapshot();
-    subscribeToChanges();
+    timer = setInterval(fetchSnapshot, POLL_INTERVAL);
   });
 
   onUnmounted(() => {
-    if (subscription) supabase.removeChannel(subscription);
+    if (timer) clearInterval(timer);
   });
 
   return { snapshot, loading, error };
