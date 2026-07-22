@@ -85,10 +85,11 @@ crontab -e
 Add:
 
 ```
-* * * * * flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
+* * * * * timeout 45 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
 ```
 
 Notes on the cron command:
+- `timeout 45` kills the process if a cycle takes longer than 45s (normal is ~13s). Prevents a hung process from holding the flock and silently killing all future runs.
 - `flock -n` skips a cycle if the previous one is still running.
 - `sh -c '...'` is needed because `flock` exec's the next argument as a binary, but `cd` is a shell built-in.
 - **Adjust paths** — replace with your actual Pi home directory. Run `echo $HOME` to confirm.

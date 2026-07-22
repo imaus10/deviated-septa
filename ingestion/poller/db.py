@@ -1,5 +1,6 @@
 import io
 import os
+import time
 
 import psycopg2
 from dotenv import load_dotenv
@@ -9,9 +10,29 @@ load_dotenv()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+_CONNECT_TIMEOUT = 10
+_KEEPALIVES_IDLE = 30
+_KEEPALIVES_INTERVAL = 10
+_KEEPALIVES_COUNT = 3
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = [2, 4, 8]
+
 
 def get_connection():
-    return psycopg2.connect(DATABASE_URL)
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=_CONNECT_TIMEOUT,
+                keepalives=1,
+                keepalives_idle=_KEEPALIVES_IDLE,
+                keepalives_interval=_KEEPALIVES_INTERVAL,
+                keepalives_count=_KEEPALIVES_COUNT,
+            )
+        except psycopg2.OperationalError:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            time.sleep(_RETRY_BACKOFF[attempt])
 
 
 def is_pg(db):
