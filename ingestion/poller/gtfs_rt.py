@@ -35,6 +35,20 @@ def scheduled_to_ts(arrival_time: str, service_date: date) -> int:
     return int(dt.timestamp())
 
 
+def infer_service_date(arrival_time: str, predicted_ts: int) -> date:
+    predicted_date = datetime.fromtimestamp(int(predicted_ts), tz=EASTERN).date()
+    candidates = [
+        predicted_date + timedelta(days=offset)
+        for offset in (-1, 0, 1)
+    ]
+    return min(
+        candidates,
+        key=lambda candidate: abs(
+            int(predicted_ts) - scheduled_to_ts(arrival_time, candidate)
+        ),
+    )
+
+
 def fetch_protobuf(url: str) -> bytes:
     resp = httpx.get(url, follow_redirects=True, timeout=30)
     resp.raise_for_status()
@@ -82,7 +96,7 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
                 log.warning("skip trip=%s seq=%s: empty arrival_time", trip_id, stop_seq)
                 continue
 
-            service_date = datetime.fromtimestamp(int(predicted_ts), tz=EASTERN).date()
+            service_date = infer_service_date(arrival, int(predicted_ts))
             scheduled_ts = scheduled_to_ts(arrival, service_date)
 
             delay = int(predicted_ts) - scheduled_ts
