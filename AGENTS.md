@@ -43,8 +43,8 @@ All tables in `public` schema. Two roles: `neondb_owner` (full access, used by p
 ### Aggregation SQL functions
 
 - `agg_daily(poll_date date)` — aggregates observations into `daily_route_metrics`
-- `agg_hourly(poll_date date)` — same but bucketed by hour into `hourly_route_metrics`
-- `agg_snapshot(poll_date date, now timestamptz)` — upserts into `latest_snapshot` from `daily_route_metrics`
+- `agg_hourly(poll_date date)` — same but bucketed by hour into `hourly_route_metrics`. Extracts hour in Eastern time (`AT TIME ZONE 'America/New_York'`).
+- `agg_snapshot(poll_date date, now timestamptz)` — upserts into `latest_snapshot` from `daily_route_metrics`. Deletes routes with no `daily_route_metrics` row for `poll_date` (orphan cleanup).
 
 All three query `real_time_observations r JOIN stop_times st ON (trip_id, stop_sequence) JOIN trips t ON trip_id` to get route_id.
 
@@ -92,7 +92,7 @@ Static tables are purely reference data — the poller re-imports them each cycl
 | `ingestion/poller/gtfs_static.py` | Download/import GTFS static feed, `get_stored_freshness()`, `run_and_record_freshness()` |
 | `ingestion/poller/models.py` | SQLAlchemy models (StopTime, RealTimeObservation, Route, Trip, Stop, Calendar, DailyRouteMetric, HourlyRouteMetric, LatestSnapshot, ServiceCycle) |
 | `ingestion/migrations/versions/001_initial_schema.py` | All table definitions |
-| `ingestion/migrations/versions/002_aggregation_functions.py` | SQL aggregation functions |
+| `ingestion/migrations/versions/002_aggregation_functions.py` | SQL aggregation functions (which are refined in subsequent migrations) |
 | `ingestion/scripts/setup_readonly_role.sql` | Creates `frontend_reader` role |
 
 ## Frontend
@@ -120,9 +120,9 @@ Frontend reads from root `.env` via Vite's `envDir: '..'`. Only `VITE_NEON_URL` 
 
 - User: `austinblanton`, host: `plant1.local` (also Tailscale `pi@100.71.198.128`)
 - Repo: `/home/austinblanton/Desktop/deviated-septa`
-- Cron: `* * * * * timeout 45 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && uv run python -m poller.main' >> /tmp/poller.log 2>&1`
+- Cron: `* * * * * timeout 180 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && uv run python -m poller.main' >> /tmp/poller.log 2>&1`
 - Logs: `/tmp/poller.log`
-- `timeout 45` kills hung processes. `flock -n` prevents overlapping runs.
+- `timeout 180` kills hung processes. `flock -n` prevents overlapping runs.
 - Needs `libpq-dev` for `psycopg2-binary`
 
 ### Neon

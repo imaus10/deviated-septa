@@ -21,6 +21,7 @@ This writes `DATABASE_URL` and `DATABASE_URL_UNPOOLED` to `.env` from your Neon 
 |---|---|
 | `DATABASE_URL` | Pooled Postgres connection — poller runtime, app queries |
 | `DATABASE_URL_UNPOOLED` | Unpooled connection — Alembic migrations, bulk imports |
+| `FRONTEND_READER_PASSWORD` | Password for the `frontend_reader` role (used by setup script) |
 
 ---
 
@@ -43,7 +44,17 @@ Creates all tables and aggregation functions in Neon.
 
 ---
 
-## 4. Import GTFS static + test poller
+## 4. Create read-only role for frontend
+
+```bash
+source .env && psql "$DATABASE_URL" -v frontend_reader_password="$FRONTEND_READER_PASSWORD" -f ingestion/scripts/setup_readonly_role.sql
+```
+
+Creates a `frontend_reader` role with SELECT-only access to `latest_snapshot`. The frontend queries Neon directly using this role. Idempotent — safe to re-run.
+
+---
+
+## 5. Import GTFS static + test poller
 
 ```bash
 cd ingestion && uv run python -m poller.main
@@ -57,7 +68,7 @@ psql "$DATABASE_URL" -c "SELECT route_id, on_time_percentage FROM latest_snapsho
 
 ---
 
-## 5. Raspberry Pi (primary poller)
+## 6. Raspberry Pi (primary poller)
 
 The poller runs every minute from a Pi with direct Postgres access.
 
@@ -85,11 +96,11 @@ crontab -e
 Add:
 
 ```
-* * * * * timeout 45 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
+* * * * * timeout 180 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
 ```
 
 Notes on the cron command:
-- `timeout 45` kills the process if a cycle takes longer than 45s (normal is ~13s). Prevents a hung process from holding the flock and silently killing all future runs.
+- `timeout 180` kills the process if a cycle takes longer than 180s. Normal cycles are ~13s, but a GTFS static reimport can take ~90s. Prevents a hung process from holding the flock and silently killing all future runs.
 - `flock -n` skips a cycle if the previous one is still running.
 - `sh -c '...'` is needed because `flock` exec's the next argument as a binary, but `cd` is a shell built-in.
 - **Adjust paths** — replace with your actual Pi home directory. Run `echo $HOME` to confirm.
@@ -109,7 +120,7 @@ sudo systemctl enable cron
 
 ---
 
-## 6. Frontend dev & deploy
+## 7. Frontend dev & deploy
 
 ```bash
 cd frontend
@@ -119,7 +130,7 @@ npm run build          # production build → dist/
 
 ---
 
-## 7. Schema change workflow
+## 8. Schema change workflow
 
 1. Edit `ingestion/poller/models.py`
 2. `cd ingestion && alembic revision --autogenerate -m "description"`
