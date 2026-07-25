@@ -21,7 +21,7 @@ if str(INGESTION_DIR) not in sys.path:
     sys.path.insert(0, str(INGESTION_DIR))
 
 from poller.db import get_connection  # noqa: E402
-from poller.gtfs_rt import infer_service_date, scheduled_to_ts  # noqa: E402
+from poller.gtfs_rt import EASTERN, infer_service_date, scheduled_to_ts  # noqa: E402
 
 
 DEFAULT_THRESHOLD_SECONDS = 12 * 60 * 60
@@ -865,9 +865,9 @@ def rebuild_metrics(conn, affected_dates: set[date]) -> None:
             cur.execute("SELECT agg_daily(%s)", [affected_date])
             cur.execute("SELECT agg_hourly(%s)", [affected_date])
 
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(EASTERN).date()
         if today in affected_dates:
-            cur.execute("SELECT agg_snapshot(%s, %s)", [today, datetime.now(timezone.utc)])
+            cur.execute("SELECT agg_snapshot(%s, %s)", [today, datetime.now(EASTERN)])
 
 
 def main(argv: list[str] | None = None) -> int:

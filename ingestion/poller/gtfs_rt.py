@@ -189,7 +189,7 @@ def update_predictions(conn, observations):
 
 
 def build_aggregations(conn):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(ZoneInfo("America/New_York"))
     today_str = now.date().isoformat()
 
     with conn.cursor() as cur:
