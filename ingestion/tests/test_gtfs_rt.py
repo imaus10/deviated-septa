@@ -172,3 +172,105 @@ def test_extract_observations_missing_cache():
 
     obs = extract_observations(feed, {})
     assert len(obs) == 0
+
+
+def test_scheduled_to_ts_fall_back():
+    """Fall-back Nov 1 — 1:30 AM repeats twice (EDT then EST).
+
+    scheduled_to_ts constructs the datetime with fold=0 (default),
+    which is the first occurrence: 1:30 AM EDT (UTC-4) = 05:30 UTC.
+    """
+    ts = scheduled_to_ts("01:30:00", date(2026, 11, 1))
+    utc_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    assert utc_dt.day == 1
+    assert utc_dt.hour == 5
+    assert utc_dt.minute == 30
+
+
+def test_infer_service_date_large_delay():
+    """Bus 2 hours late — scheduled 23:30 on July 22, predicted 01:30 July 23.
+
+    infer_service_date should still pick July 22 as the service date
+    because the scheduled timestamp for July 22 is closer than July 23.
+    """
+    scheduled_ts = scheduled_to_ts("23:30:00", date(2026, 7, 22))
+    predicted_ts = scheduled_ts + 2 * 3600
+
+    result = infer_service_date("23:30:00", predicted_ts)
+    assert result == date(2026, 7, 22)
+
+
+def test_infer_service_date_dst_boundary():
+    """At DST spring-forward boundary, infer_service_date still picks correctly.
+
+    March 8 2026: clocks spring forward at 2:00 AM.
+    A bus scheduled at 01:30 AM that arrives at 03:30 AM (after the gap)
+    should still be attributed to March 8.
+    """
+    scheduled_ts = scheduled_to_ts("01:30:00", date(2026, 3, 8))
+    predicted_ts = scheduled_ts + 2 * 3600
+
+    result = infer_service_date("01:30:00", predicted_ts)
+    assert result == date(2026, 3, 8)
+
+
+def test_extract_observations_midnight_crossing_stops():
+    """Stop 1 at 23:59, stop 2 at 00:01 — both should get the same service_date."""
+    from google.transit import gtfs_realtime_pb2
+
+    ts1 = scheduled_to_ts("23:59:00", date(2026, 7, 22))
+    ts2 = scheduled_to_ts("24:01:00", date(2026, 7, 22))
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.timestamp = ts2
+
+    e = feed.entity.add()
+    e.trip_update.trip.trip_id = "t-cross"
+
+    stu1 = e.trip_update.stop_time_update.add()
+    stu1.stop_sequence = 1
+    stu1.arrival.time = ts1
+
+    stu2 = e.trip_update.stop_time_update.add()
+    stu2.stop_sequence = 2
+    stu2.arrival.time = ts2
+
+    cache = {
+        "t-cross": {
+            1: {"arrival_time": "23:59:00", "stop_id": "A"},
+            2: {"arrival_time": "24:01:00", "stop_id": "B"},
+        }
+    }
+
+    obs = extract_observations(feed, cache)
+    assert len(obs) == 2
+    assert obs[0]["service_date"] == date(2026, 7, 22)
+    assert obs[1]["service_date"] == date(2026, 7, 22)
+
+
+def test_extract_observations_exact_midnight():
+    """24:00:00 scheduled — prediction exactly at midnight boundary."""
+    from google.transit import gtfs_realtime_pb2
+
+    predicted_ts = scheduled_to_ts("24:00:00", date(2026, 7, 22))
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.timestamp = predicted_ts
+
+    e = feed.entity.add()
+    e.trip_update.trip.trip_id = "t-midnight-exact"
+
+    stu = e.trip_update.stop_time_update.add()
+    stu.stop_sequence = 1
+    stu.arrival.time = predicted_ts
+
+    cache = {
+        "t-midnight-exact": {
+            1: {"arrival_time": "24:00:00", "stop_id": "A"},
+        }
+    }
+
+    obs = extract_observations(feed, cache)
+    assert len(obs) == 1
+    assert obs[0]["service_date"] == date(2026, 7, 22)
+    assert obs[0]["delay_seconds"] == 0
