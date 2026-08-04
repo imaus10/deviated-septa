@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, BigInteger, Float, Text, Date, ForeignKey,
-    UniqueConstraint,
+    Index, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import declarative_base
@@ -86,6 +86,7 @@ class RealTimeObservation(Base):
     __table_args__ = (
         UniqueConstraint("trip_id", "stop_sequence", "service_date",
                          name="uq_obs_trip_stop_date"),
+        Index("ix_obs_poll_timestamp", "poll_timestamp"),
     )
 
 
@@ -129,6 +130,7 @@ class HourlyRouteMetric(Base):
 class LatestSnapshot(Base):
     __tablename__ = "latest_snapshot"
 
+    granularity = Column(Text, primary_key=True)
     route_id = Column(Text, primary_key=True)
     route_name = Column(Text, nullable=True)
     route_type = Column(Integer, nullable=True)

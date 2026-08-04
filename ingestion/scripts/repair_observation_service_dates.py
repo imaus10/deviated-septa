@@ -867,7 +867,10 @@ def rebuild_metrics(conn, affected_dates: set[date]) -> None:
 
         today = datetime.now(EASTERN).date()
         if today in affected_dates:
-            cur.execute("SELECT agg_snapshot(%s, %s)", [today, datetime.now(EASTERN)])
+            cur.execute("SELECT agg_snapshot_daily(%s, %s)", [today, datetime.now(EASTERN).isoformat()])
+
+        cur.execute("SELECT agg_snapshot_hourly(%s)", [datetime.now(EASTERN).isoformat()])
+        cur.execute("SELECT agg_snapshot_weekly(%s)", [datetime.now(EASTERN).isoformat()])
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -198,11 +198,16 @@ def build_aggregations(conn):
     print("  daily aggregation done")
 
     with conn.cursor() as cur:
-        cur.execute("SELECT agg_hourly(%s)", [today_str])
+        cur.execute("SELECT agg_snapshot_daily(%s, %s)", [today_str, now.isoformat()])
         conn.commit()
-    print("  hourly aggregation done")
+    print("  daily snapshot done")
 
     with conn.cursor() as cur:
-        cur.execute("SELECT agg_snapshot(%s, %s)", [today_str, now.isoformat()])
+        cur.execute("SELECT agg_snapshot_hourly(%s)", [now.isoformat()])
         conn.commit()
-    print("  snapshot done")
+    print("  hourly snapshot done")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT agg_snapshot_weekly(%s)", [now.isoformat()])
+        conn.commit()
+    print("  weekly snapshot done")
