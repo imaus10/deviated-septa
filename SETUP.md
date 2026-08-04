@@ -63,7 +63,7 @@ cd ingestion && uv run python -m poller.main
 Downloads SEPTA's GTFS static feed, imports it, fetches real-time predictions, and runs aggregations. Verify with:
 
 ```bash
-psql "$DATABASE_URL" -c "SELECT route_id, on_time_percentage FROM latest_snapshot ORDER BY total_observations DESC LIMIT 5;"
+psql "$DATABASE_URL" -c "SELECT route_id, on_time_percentage FROM latest_snapshot WHERE granularity = 'daily' ORDER BY total_observations DESC LIMIT 5;"
 ```
 
 ---
@@ -124,9 +124,11 @@ sudo systemctl enable cron
 
 ```bash
 cd frontend
-npm run dev            # local dev (hot-reload)
+npm run dev            # local dev (hot-reload) — targets Neon
 npm run build          # production build → dist/
 ```
+
+For local dev against a Postgres database instead of Neon, run `VITE_NEON_FETCH_ENDPOINT=/sql npm run dev` — the Vite dev server serves a `/sql` endpoint that mimics the Neon HTTP protocol. Restart the dev server after toggling between the two.
 
 ---
 
@@ -137,7 +139,7 @@ npm run build          # production build → dist/
 3. Review the generated file in `ingestion/migrations/versions/`
 4. Test locally: `cd ingestion && alembic upgrade head`
 5. Commit the migration
-6. Run `alembic upgrade head` against Neon
+6. Run `alembic upgrade head` against Neon — stop the Pi cron first, since the old poller binary may call aggregation functions dropped by the migration
 
 ---
 
