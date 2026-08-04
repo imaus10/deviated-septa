@@ -6,7 +6,7 @@ const props = defineProps({
 });
 
 const sortKey = ref("on_time_percentage");
-const sortDir = ref("asc");
+const sortDir = ref("desc");
 
 function setSort(key) {
   if (sortKey.value === key) {
@@ -20,7 +20,6 @@ function setSort(key) {
 function sortVal(r, key) {
   const v = r[key];
   if (key === "route_id") return v ?? "";
-  if (key === "route_name") return (v ?? "").toLowerCase();
   return v ?? 0;
 }
 
@@ -65,36 +64,36 @@ function otpColor(pct) {
   <table class="route-table">
     <thead>
       <tr>
-        <th class="sortable" @click="setSort('route_type')">#{{ sortIcon('route_type') }}</th>
+        <th class="sortable" @click="setSort('route_type')">Mode{{ sortIcon('route_type') }}</th>
         <th class="sortable" @click="setSort('route_id')">Route{{ sortIcon('route_id') }}</th>
-        <th class="sortable" @click="setSort('route_name')">Name{{ sortIcon('route_name') }}</th>
-        <th class="sortable" @click="setSort('total_observations')">Obs{{ sortIcon('total_observations') }}</th>
-        <th class="sortable" @click="setSort('on_time_count')">OT{{ sortIcon('on_time_count') }}</th>
+        <th class="sortable" @click="setSort('on_time_percentage')">On-time %{{ sortIcon('on_time_percentage') }}</th>
+        <th class="sortable" @click="setSort('avg_delay_seconds')">Avg delay{{ sortIcon('avg_delay_seconds') }}</th>
+        <th class="sortable" @click="setSort('on_time_count')">On-time{{ sortIcon('on_time_count') }}</th>
         <th class="sortable" @click="setSort('early_count')">Early{{ sortIcon('early_count') }}</th>
         <th class="sortable" @click="setSort('late_count')">Late{{ sortIcon('late_count') }}</th>
-        <th class="sortable" @click="setSort('on_time_percentage')">OTP%{{ sortIcon('on_time_percentage') }}</th>
-        <th class="sortable" @click="setSort('avg_delay_seconds')">Delay{{ sortIcon('avg_delay_seconds') }}</th>
+        <th class="sortable" @click="setSort('total_observations')">Total{{ sortIcon('total_observations') }}</th>
       </tr>
     </thead>
     <tbody>
       <tr v-for="r in sorted" :key="r.route_id">
         <td class="type-cell">{{ typeLabel(r.route_type) }}</td>
-        <td class="route-id">{{ r.route_id }}</td>
-        <td class="route-name">{{ r.route_name ?? "—" }}</td>
-        <td>{{ (r.total_observations ?? 0).toLocaleString() }}</td>
-        <td>{{ (r.on_time_count ?? 0).toLocaleString() }}</td>
-        <td>{{ (r.early_count ?? 0).toLocaleString() }}</td>
-        <td>{{ (r.late_count ?? 0).toLocaleString() }}</td>
+        <td class="route-id" :title="r.route_id">{{ r.route_name ?? r.route_id }}</td>
         <td>
-          <div class="otp-bar-container">
-            <div
-              class="otp-bar"
-              :style="{ width: (r.on_time_percentage ?? 0) + '%', background: otpColor(r.on_time_percentage) }"
-            ></div>
+          <div class="otp-cell">
+            <div class="otp-track">
+              <div
+                class="otp-bar"
+                :style="{ width: (r.on_time_percentage ?? 0) + '%', background: otpColor(r.on_time_percentage) }"
+              ></div>
+            </div>
             <span class="otp-text">{{ r.on_time_percentage != null ? r.on_time_percentage + '%' : '—' }}</span>
           </div>
         </td>
         <td>{{ formatDelay(r.avg_delay_seconds) }}</td>
+        <td>{{ (r.on_time_count ?? 0).toLocaleString() }}</td>
+        <td>{{ (r.early_count ?? 0).toLocaleString() }}</td>
+        <td>{{ (r.late_count ?? 0).toLocaleString() }}</td>
+        <td>{{ (r.total_observations ?? 0).toLocaleString() }}</td>
       </tr>
     </tbody>
   </table>
@@ -104,15 +103,17 @@ function otpColor(pct) {
 .route-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.78rem;
+  font-size: 0.72rem;
 }
 th {
   text-align: left;
-  padding: 0.35rem 0.4rem;
+  padding: 0.25rem 0.3rem;
   color: #888;
   border-bottom: 1px solid #333;
   font-weight: 600;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 th.sortable {
   cursor: pointer;
@@ -122,34 +123,41 @@ th.sortable:hover {
   color: #ccc;
 }
 td {
-  padding: 0.3rem 0.4rem;
+  padding: 0.25rem 0.3rem;
   border-bottom: 1px solid #222;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .route-id {
   font-weight: 700;
   color: #e0e0e0;
-}
-.route-name {
-  color: #aaa;
 }
 .type-cell {
   color: #666;
   font-size: 0.7rem;
   text-align: center;
 }
-.otp-bar-container {
+.otp-cell {
   display: flex;
   align-items: center;
   gap: 0.4rem;
 }
-.otp-bar {
+.otp-track {
+  flex: none;
+  width: 64px;
   height: 8px;
   border-radius: 4px;
-  min-width: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.otp-bar {
+  height: 100%;
+  border-radius: 4px;
   transition: width 0.3s;
 }
 .otp-text {
-  font-size: 0.8rem;
+  font-size: 0.72rem;
   white-space: nowrap;
 }
 </style>

@@ -5,13 +5,19 @@ import KpiHeader from "./components/KpiHeader.vue";
 import RouteTable from "./components/RouteTable.vue";
 import RouteMap from "./components/RouteMap.vue";
 
-const { snapshot, loading, error } = useDashboardData();
+const { rows, granularity, loading, error } = useDashboardData();
 
 const allRoutes = computed(() =>
-  snapshot.value.filter((r) => r.route_type === 0 || r.route_type === 3),
+  rows.value.filter((r) => r.route_type === 0 || r.route_type === 3),
 );
 
-const showList = ref(true);
+const granularities = [
+  { value: "hourly", label: "Last Hour", title: "Stop arrivals refreshed in the last 60 minutes" },
+  { value: "daily", label: "Today", title: "Today's service date" },
+  { value: "weekly", label: "Last 7 Days", title: "Past 7 service dates including today" },
+];
+
+const showList = ref(false);
 </script>
 
 <template>
@@ -20,21 +26,33 @@ const showList = ref(true);
     <div v-else-if="loading" class="loading">Loading...</div>
     <template v-else>
       <div class="map-layer">
-        <RouteMap :routes="snapshot" />
+        <RouteMap :routes="rows" />
       </div>
 
       <div class="title-bar"><span class="title-red">deviated</span> <span class="title-green">SEPTA</span></div>
+      <div class="granularity-control">
+        <button
+          v-for="g in granularities"
+          :key="g.value"
+          class="gran-control-btn"
+          :class="{ active: granularity === g.value }"
+          :title="g.title"
+          @click="granularity = g.value"
+        >
+          {{ g.label }}
+        </button>
+      </div>
       <div class="kpi-rail">
-        <KpiHeader :routes="snapshot" />
+        <KpiHeader :routes="rows" />
       </div>
 
       <button class="toggle-btn" :class="{ hidden: showList }" @click="showList = true">
-        ☰
+        ☰ Route Ranking
       </button>
 
       <div class="list-pane" :class="{ open: showList }">
         <div class="pane-header">
-          <h2>Routes</h2>
+          <h2>Route Ranking</h2>
           <button class="close-btn" @click="showList = false">✕</button>
         </div>
         <RouteTable :routes="allRoutes" />
@@ -83,6 +101,37 @@ body {
 }
 .title-red { color: #f44336; }
 .title-green { color: #4caf50; }
+.granularity-control {
+  position: absolute;
+  top: 4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  gap: 0.25rem;
+  background: rgba(26, 26, 46, 0.85);
+  padding: 0.25rem;
+  border-radius: 8px;
+  backdrop-filter: blur(4px);
+}
+.gran-control-btn {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.35rem 0.9rem;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.gran-control-btn:hover {
+  color: #ccc;
+}
+.gran-control-btn.active {
+  background: #3a3a5e;
+  color: #e0e0e0;
+}
 .kpi-rail {
   position: absolute;
   top: 4rem;
@@ -104,9 +153,9 @@ body {
   background: rgba(26, 26, 46, 0.85);
   border: 1px solid #333;
   color: #ccc;
-  font-size: 1.2rem;
-  width: 2.2rem;
-  height: 2.2rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.5rem 0.9rem;
   border-radius: 6px;
   cursor: pointer;
   backdrop-filter: blur(4px);
@@ -122,7 +171,7 @@ body {
   position: absolute;
   top: 0;
   right: 0;
-  width: 480px;
+  width: 560px;
   height: 100vh;
   background: rgba(22, 22, 42, 0.95);
   border-left: 1px solid #333;

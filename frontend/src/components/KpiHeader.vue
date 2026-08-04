@@ -22,10 +22,6 @@ const systemOtp = computed(() => {
   return ((onTime / total) * 100).toFixed(1);
 });
 
-const totalObs = computed(() =>
-  props.routes.reduce((s, r) => s + (r.total_observations || 0), 0),
-);
-
 const formattedAvgDelay = computed(() => {
   const withDelay = props.routes.filter((r) => r.avg_delay_seconds != null);
   if (withDelay.length === 0) return null;
@@ -49,14 +45,6 @@ const lastUpdated = computed(() => {
     <div class="kpi-card">
       <span class="kpi-value">{{ systemOtp ?? "—" }}%</span>
       <span class="kpi-label">System On-Time</span>
-    </div>
-    <div class="kpi-card">
-      <span class="kpi-value">{{ props.routes.length }}</span>
-      <span class="kpi-label">Routes Tracked</span>
-    </div>
-    <div class="kpi-card">
-      <span class="kpi-value">{{ totalObs.toLocaleString() }}</span>
-      <span class="kpi-label">Stop Observations Today</span>
     </div>
     <div class="kpi-card">
       <span class="kpi-value">{{ formattedAvgDelay ?? "—" }}</span>

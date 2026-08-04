@@ -1,12 +1,18 @@
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { sql } from "../lib/neon.js";
 
 const POLL_INTERVAL = 60_000;
+const DEFAULT_GRANULARITY = "hourly";
 
 export function useDashboardData() {
   const snapshot = ref([]);
+  const granularity = ref(DEFAULT_GRANULARITY);
   const loading = ref(true);
   const error = ref(null);
+
+  const rows = computed(() =>
+    snapshot.value.filter((r) => r.granularity === granularity.value),
+  );
 
   let timer = null;
 
@@ -30,5 +36,5 @@ export function useDashboardData() {
     if (timer) clearInterval(timer);
   });
 
-  return { snapshot, loading, error };
+  return { snapshot, rows, granularity, loading, error };
 }
