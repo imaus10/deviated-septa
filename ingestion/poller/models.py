@@ -130,7 +130,7 @@ class HourlyRouteMetric(Base):
 class LatestSnapshot(Base):
     __tablename__ = "latest_snapshot"
 
-    granularity = Column(Text, primary_key=True)
+    period = Column(Text, primary_key=True)
     route_id = Column(Text, primary_key=True)
     route_name = Column(Text, nullable=True)
     route_type = Column(Integer, nullable=True)

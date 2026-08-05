@@ -63,7 +63,7 @@ cd ingestion && uv run python -m poller.main
 Downloads SEPTA's GTFS static feed, imports it, fetches real-time predictions, and runs aggregations. Verify with:
 
 ```bash
-psql "$DATABASE_URL" -c "SELECT route_id, on_time_percentage FROM latest_snapshot WHERE granularity = 'daily' ORDER BY total_observations DESC LIMIT 5;"
+psql "$DATABASE_URL" -c "SELECT route_id, on_time_percentage FROM latest_snapshot WHERE period = 'daily' ORDER BY total_observations DESC LIMIT 5;"
 ```
 
 ---
@@ -96,11 +96,11 @@ crontab -e
 Add:
 
 ```
-* * * * * timeout 180 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
+* * * * * timeout 420 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
 ```
 
 Notes on the cron command:
-- `timeout 180` kills the process if a cycle takes longer than 180s. Normal cycles are ~13s, but a GTFS static reimport can take ~90s. Prevents a hung process from holding the flock and silently killing all future runs.
+- `timeout 420` kills the process if a cycle takes longer than 420s (7 min). Normal cycles are ~13s, but a GTFS static reimport can take ~5 min. Prevents a hung process from holding the flock and silently killing all future runs.
 - `flock -n` skips a cycle if the previous one is still running.
 - `sh -c '...'` is needed because `flock` exec's the next argument as a binary, but `cd` is a shell built-in.
 - **Adjust paths** — replace with your actual Pi home directory. Run `echo $HOME` to confirm.

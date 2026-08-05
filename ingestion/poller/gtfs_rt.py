@@ -211,3 +211,8 @@ def build_aggregations(conn):
         cur.execute("SELECT agg_snapshot_weekly(%s)", [now.isoformat()])
         conn.commit()
     print("  weekly snapshot done")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT agg_snapshot_all(%s)", [now.isoformat()])
+        conn.commit()
+    print("  all-time snapshot done")

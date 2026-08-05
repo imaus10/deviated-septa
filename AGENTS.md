@@ -38,17 +38,18 @@ All tables in `public` schema. Two roles: `neondb_owner` (full access, used by p
 |-------|---------|
 | `daily_route_metrics` | Aggregated from `real_time_observations` via `agg_daily()`. One row per route per day. |
 | `hourly_route_metrics` | Aggregated via `agg_hourly()`. One row per route per hour. |
-| `latest_snapshot` | One row per route per granularity (`hourly`/`daily`/`weekly`). PK `(granularity, route_id)`. Built by `agg_snapshot_daily/hourly/weekly`. **This is the only table the frontend reads.** |
+| `latest_snapshot` | One row per route per period (`hourly`/`daily`/`weekly`/`all`). PK `(period, route_id)`. Built by `agg_snapshot_daily/hourly/weekly/all`. **This is the only table the frontend reads.** |
 
 ### Aggregation SQL functions
 
 - `agg_daily(poll_date date)` — aggregates observations into `daily_route_metrics`
 - `agg_hourly(poll_date date)` — same but bucketed by hour into `hourly_route_metrics`. Extracts hour in Eastern time (`AT TIME ZONE 'America/New_York'`).
-- `agg_snapshot_daily(poll_date date, now timestamptz)` — upserts today's `daily_route_metrics` row into `latest_snapshot` (granularity `daily`)
-- `agg_snapshot_hourly(now timestamptz)` — aggregates raw observations with `poll_timestamp >= now - interval '1 hour'` straight into `latest_snapshot` (granularity `hourly`)
-- `agg_snapshot_weekly(now timestamptz)` — sums the last 7 days of `daily_route_metrics` into `latest_snapshot` (granularity `weekly`)
+- `agg_snapshot_daily(poll_date date, now timestamptz)` — upserts today's `daily_route_metrics` row into `latest_snapshot` (period `daily`)
+- `agg_snapshot_hourly(now timestamptz)` — aggregates raw observations with `poll_timestamp >= now - interval '1 hour'` straight into `latest_snapshot` (period `hourly`)
+- `agg_snapshot_weekly(now timestamptz)` — sums the last 7 days of `daily_route_metrics` into `latest_snapshot` (period `weekly`)
+- `agg_snapshot_all(now timestamptz)` — sums all of `daily_route_metrics` into `latest_snapshot` (period `all`)
 
-All snapshot functions also `DELETE` orphaned routes (no row in the source for the period). Period semantics in the UI: Last Hour = stop arrivals refreshed in the last 60 minutes, Today = today's service date, Last 7 Days = past 7 service dates.
+All snapshot functions also `DELETE` orphaned routes (no row in the source for the period). Period semantics in the UI: Last Hour = stop arrivals refreshed in the last 60 minutes, Today = today's service date, Last 7 Days = past 7 service dates, All Time = every available service date.
 
 `agg_daily`, `agg_hourly`, and `agg_snapshot_hourly` query `real_time_observations r JOIN stop_times st ON (trip_id, stop_sequence) JOIN trips t ON trip_id` to get route_id; the daily/weekly snapshots read `daily_route_metrics` instead.
 
@@ -68,7 +69,7 @@ All snapshot functions also `DELETE` orphaned routes (no row in the source for t
 4. **Load stop_times** — `SELECT trip_id, stop_sequence, arrival_time, stop_id FROM stop_times WHERE trip_id = ANY(trip_ids)` into a dict cache
 5. **Extract observations** — for each entity in the feed, for each stop_time_update with a valid arrival, compute delay = predicted_timestamp - scheduled_timestamp
 6. **Update predictions** — COPY observations into a temp table, INSERT ON CONFLICT (trip_id, stop_sequence, service_date) DO UPDATE into `real_time_observations`
-7. **Run aggregations** — call `agg_daily`, `agg_snapshot_daily`, `agg_snapshot_hourly`, `agg_snapshot_weekly`
+7. **Run aggregations** — call `agg_daily`, `agg_snapshot_daily`, `agg_snapshot_hourly`, `agg_snapshot_weekly`, `agg_snapshot_all`
 
 ### GTFS static feed regeneration
 
@@ -107,8 +108,8 @@ Vue 3 (Composition API `<script setup>`), pure JS (no TypeScript), Vite, Leaflet
 
 | File | Role |
 |------|------|
-| `frontend/src/App.vue` | Entry — composes RouteMap, RouteTable, KpiHeader. Segmented granularity control (Last Hour / Today / Last 7 Days); Route Ranking pane default collapsed behind a "☰ Route Ranking" toggle |
-| `frontend/src/composables/useDashboardData.js` | Fetches all granularities from `latest_snapshot` in one query via Neon HTTP, filters client-side by selected granularity (default `hourly`), polls every 60s |
+| `frontend/src/App.vue` | Entry — composes RouteMap, RouteTable, KpiHeader. Segmented period control (Last Hour / Today / Last 7 Days / All Time); Route Ranking pane default collapsed behind a "☰ Route Ranking" toggle |
+| `frontend/src/composables/useDashboardData.js` | Fetches all periods from `latest_snapshot` in one query via Neon HTTP, filters client-side by selected period (default `hourly`), polls every 60s |
 | `frontend/src/lib/neon.js` | Exports `sql` tagged template function from `@neondatabase/serverless`. In dev, optionally points at a Vite dev-server `/sql` shim via `neonConfig.fetchEndpoint` when `VITE_NEON_FETCH_ENDPOINT` is set (stripped from production builds) |
 | `frontend/src/components/RouteTable.vue` | 8-column sortable table (Mode, Route, On-time %, Avg delay, On-time, Early, Late, Total) with OTP bars; columns auto-size to content |
 | `frontend/src/components/RouteMap.vue` | Leaflet map with geojson overlays, markers |

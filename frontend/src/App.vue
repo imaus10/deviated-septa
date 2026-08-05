@@ -5,16 +5,17 @@ import KpiHeader from "./components/KpiHeader.vue";
 import RouteTable from "./components/RouteTable.vue";
 import RouteMap from "./components/RouteMap.vue";
 
-const { rows, granularity, loading, error } = useDashboardData();
+const { rows, period, loading, error } = useDashboardData();
 
 const allRoutes = computed(() =>
   rows.value.filter((r) => r.route_type === 0 || r.route_type === 3),
 );
 
-const granularities = [
+const periods = [
   { value: "hourly", label: "Last Hour", title: "Stop arrivals refreshed in the last 60 minutes" },
   { value: "daily", label: "Today", title: "Today's service date" },
   { value: "weekly", label: "Last 7 Days", title: "Past 7 service dates including today" },
+  { value: "all", label: "All Time", title: "All available observations since tracking began" },
 ];
 
 const showList = ref(false);
@@ -30,14 +31,14 @@ const showList = ref(false);
       </div>
 
       <div class="title-bar"><span class="title-red">deviated</span> <span class="title-green">SEPTA</span></div>
-      <div class="granularity-control">
+      <div class="period-control">
         <button
-          v-for="g in granularities"
+          v-for="g in periods"
           :key="g.value"
-          class="gran-control-btn"
-          :class="{ active: granularity === g.value }"
+          class="period-btn"
+          :class="{ active: period === g.value }"
           :title="g.title"
-          @click="granularity = g.value"
+          @click="period = g.value"
         >
           {{ g.label }}
         </button>
@@ -101,7 +102,7 @@ body {
 }
 .title-red { color: #f44336; }
 .title-green { color: #4caf50; }
-.granularity-control {
+.period-control {
   position: absolute;
   top: 4rem;
   left: 50%;
@@ -114,7 +115,7 @@ body {
   border-radius: 8px;
   backdrop-filter: blur(4px);
 }
-.gran-control-btn {
+.period-btn {
   background: none;
   border: none;
   color: #888;
@@ -125,10 +126,10 @@ body {
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
 }
-.gran-control-btn:hover {
+.period-btn:hover {
   color: #ccc;
 }
-.gran-control-btn.active {
+.period-btn.active {
   background: #3a3a5e;
   color: #e0e0e0;
 }
