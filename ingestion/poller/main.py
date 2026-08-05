@@ -49,9 +49,29 @@ def main():
 
         t3 = time.perf_counter()
         stop_cache = gtfs_rt.load_stop_times(conn, trip_ids)
+        matched = len(stop_cache)
+        missing = sorted(trip_ids - stop_cache.keys())
+
         if not stop_cache:
-            print("no matching stop_times found; static data may need refresh", flush=True)
+            print(
+                f"  [coverage] 0/{len(trip_ids)} trips matched static; "
+                "NONE found, static data may be stale",
+                flush=True,
+            )
             return
+        if missing:
+            sample = ", ".join(missing[:10])
+            extra = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+            print(
+                f"  [coverage] {matched}/{len(trip_ids)} trips matched static; "
+                f"{len(missing)} MISSING: {sample}{extra}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [coverage] {matched}/{len(trip_ids)} trips matched static",
+                flush=True,
+            )
         _log_time("load stop_times", time.perf_counter() - t3)
 
         t4 = time.perf_counter()
