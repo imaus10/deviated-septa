@@ -1,4 +1,5 @@
 import io
+import itertools
 import os
 import time
 
@@ -58,28 +59,44 @@ def upsert_table(conn, table, rows, pk_cols, page_size=5000):
     conn.commit()
 
 
-def copy_upsert(conn, table, rows, pk_cols):
-    if not rows:
-        return
-    cols = list(rows[0].keys())
+def copy_upsert_chunked(conn, table, rows, pk_cols, chunk_size=50000):
+    it = iter(rows)
+    try:
+        first = next(it)
+    except StopIteration:
+        return 0
+
+    cols = list(first.keys())
     col_str = ", ".join(cols)
     conflict_str = ", ".join(pk_cols)
     update_cols = [c for c in cols if c not in pk_cols]
     update_str = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
 
-    buf = io.StringIO()
-    for row in rows:
-        buf.write("\t".join(_txt_val(row[c]) for c in cols) + "\n")
-    buf.seek(0)
-
+    total = 0
     with conn.cursor() as cur:
         cur.execute(f"CREATE TEMP TABLE _stg (LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP")
-        cur.copy_from(buf, "_stg", sep="\t", null="\\N", columns=cols)
+        for batch in _batches(itertools.chain([first], it), chunk_size):
+            buf = io.StringIO()
+            for row in batch:
+                buf.write("\t".join(_txt_val(row[c]) for c in cols) + "\n")
+            buf.seek(0)
+            cur.copy_from(buf, "_stg", sep="\t", null="\\N", columns=cols)
+            total += len(batch)
         cur.execute(
             f"INSERT INTO {table} ({col_str}) SELECT {col_str} FROM _stg "
             f"ON CONFLICT ({conflict_str}) DO UPDATE SET {update_str}"
         )
     conn.commit()
+    return total
+
+
+def _batches(iterable, size):
+    it = iter(iterable)
+    while True:
+        batch = list(itertools.islice(it, size))
+        if not batch:
+            return
+        yield batch
 
 
 def _txt_val(v):

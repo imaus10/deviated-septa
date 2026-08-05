@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from poller.db import copy_upsert, upsert_table
+from poller.db import copy_upsert_chunked, upsert_table
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
 
@@ -79,8 +79,8 @@ def import_stops(db, rows):
 
 
 def _prep_stop_times(rows):
-    return [
-        {
+    for r in rows:
+        yield {
             "trip_id": r["trip_id"],
             "stop_sequence": int(r["stop_sequence"]),
             "stop_id": r["stop_id"],
@@ -89,14 +89,12 @@ def _prep_stop_times(rows):
             "pickup_type": int(r["pickup_type"]) if r.get("pickup_type") else None,
             "drop_off_type": int(r["drop_off_type"]) if r.get("drop_off_type") else None,
         }
-        for r in rows
-    ]
 
 
-def import_stop_times(db, rows):
-    prep = _prep_stop_times(rows)
-    copy_upsert(db, "stop_times", prep, pk_cols=["trip_id", "stop_sequence"])
-    return len(prep)
+def import_stop_times(db, reader):
+    return copy_upsert_chunked(
+        db, "stop_times", _prep_stop_times(reader), pk_cols=["trip_id", "stop_sequence"]
+    )
 
 
 def _prep_calendar(rows):
@@ -128,7 +126,6 @@ IMPORT_FUNCS = {
     "calendar.txt": import_calendar,
     "trips.txt": import_trips,
     "stops.txt": import_stops,
-    "stop_times.txt": import_stop_times,
 }
 
 
@@ -184,6 +181,16 @@ def run(db, gtfs_zip=None):
                 n = func(db, rows)
                 counts[filename] = n
                 print(f"  imported {n} rows from {filename} in {time.perf_counter() - t0:.1f}s", flush=True)
+
+            if "stop_times.txt" in z.namelist():
+                t0 = time.perf_counter()
+                with z.open("stop_times.txt") as raw:
+                    reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig"))
+                    n = import_stop_times(db, reader)
+                counts["stop_times.txt"] = n
+                print(f"  imported {n} rows from stop_times.txt in {time.perf_counter() - t0:.1f}s", flush=True)
+            else:
+                print("  skipping stop_times.txt (not in zip)", flush=True)
 
     return counts
 
