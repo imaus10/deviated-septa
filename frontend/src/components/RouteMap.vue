@@ -186,6 +186,10 @@ onUnmounted(() => {
 </style>
 
 <style>
+.leaflet-container svg path {
+  outline: none;
+}
+
 .boundary-path {
   filter: drop-shadow(0 0 14px rgba(255, 255, 255, 0.4))
           drop-shadow(0 0 6px rgba(255, 255, 255, 0.6));
