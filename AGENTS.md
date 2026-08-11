@@ -126,10 +126,11 @@ Frontend reads from root `.env` via Vite's `envDir: '..'`. Only `VITE_NEON_URL` 
 
 - User: `austinblanton`, host: `plant1.local` (also Tailscale `pi@100.71.198.128`)
 - Repo: `/home/austinblanton/Desktop/deviated-septa`
-- Cron: `* * * * * timeout 180 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && uv run python -m poller.main' >> /tmp/poller.log 2>&1`
+- Cron: `* * * * * timeout 420 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && uv run python -m poller.main' >> /tmp/poller.log 2>&1`
 - Logs: `/tmp/poller.log`
-- `timeout 180` kills hung processes. `flock -n` prevents overlapping runs.
+- `timeout 420` kills hung processes (a static reimport can take ~5 min). `flock -n` prevents overlapping runs.
 - Needs `libpq-dev` for `psycopg2-binary`
+- WiFi recovery: `nmcli connection modify "Verizon_CK4G7P" connection.autoconnect-retries -1` (never give up reconnecting) plus `ingestion/scripts/wifi-watchdog.sh` from cron every minute: pings gateway + 8.8.8.8, force-reconnects after 3 consecutive failures, reboots after 6. Cron (must run with sudo to write /var/log): `* * * * * flock -n /tmp/wifi-watchdog.lock sudo -n /home/austinblanton/Desktop/deviated-septa/ingestion/scripts/wifi-watchdog.sh`. Logs: `/var/log/wifi-watchdog.log` (survives reboots), reboot marker: `/var/log/wifi-watchdog.rebooted`, failure state: `/tmp/wifi-watchdog.failures`.
 
 ### Neon
 

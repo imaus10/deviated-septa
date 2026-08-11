@@ -110,6 +110,7 @@ Notes on the cron command:
 
 ```bash
 tail -f /tmp/poller.log
+tail -f /var/log/wifi-watchdog.log    # wifi watchdog (see below)
 ```
 
 ### Ensure cron survives reboot
@@ -117,6 +118,29 @@ tail -f /tmp/poller.log
 ```bash
 sudo systemctl enable cron
 ```
+
+### WiFi resilience (recommended)
+
+Recover from wifi drops without manual power-cycling. Two parts:
+
+1. **Never give up reconnecting** (per profile, persists across reboots):
+   ```bash
+   sudo nmcli connection modify "Verizon_CK4G7P" connection.autoconnect-retries -1
+   ```
+   Verify: `nmcli -g connection.autoconnect-retries connection show "Verizon_CK4G7P"` → `-1`.
+
+2. **Watchdog** — `ingestion/scripts/wifi-watchdog.sh`, run every minute. It pings the gateway then 8.8.8.8 (only counts a failure if both are unreachable), force-reactivates the connection after 3 consecutive failures, and reboots after 6 (writes a durable marker first). Log: `/var/log/wifi-watchdog.log` (survives reboots); a successful check after a watchdog reboot logs `link restored via reboot`.
+
+   Needs passwordless sudo to write /var/log and call `nmcli`/`systemctl` (already present if `sudo -n true` works):
+   ```bash
+   chmod +x ingestion/scripts/wifi-watchdog.sh
+   crontab -e   # add:
+   ```
+   ```
+   * * * * * flock -n /tmp/wifi-watchdog.lock sudo -n /home/austinblanton/Desktop/deviated-septa/ingestion/scripts/wifi-watchdog.sh
+   ```
+
+   Monitor: `tail -f /var/log/wifi-watchdog.log`
 
 ---
 
