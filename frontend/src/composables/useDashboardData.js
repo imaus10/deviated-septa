@@ -6,6 +6,7 @@ const DEFAULT_PERIOD = "hourly";
 
 export function useDashboardData() {
   const snapshot = ref([]);
+  const routeGeometries = ref([]);
   const period = ref(DEFAULT_PERIOD);
   const loading = ref(true);
   const error = ref(null);
@@ -18,8 +19,20 @@ export function useDashboardData() {
 
   async function fetchSnapshot() {
     try {
-      const rows = await sql`SELECT * FROM latest_snapshot ORDER BY route_id`;
-      snapshot.value = rows;
+      const [snapRows, geoRows] = await Promise.all([
+        sql`
+          SELECT *
+          FROM latest_snapshot
+          ORDER BY entity_type, entity_id
+        `,
+        sql`
+          SELECT *
+          FROM route_geometries
+          ORDER BY route_id
+        `,
+      ]);
+      snapshot.value = snapRows;
+      routeGeometries.value = geoRows;
       loading.value = false;
       error.value = null;
     } catch (e) {
@@ -36,5 +49,5 @@ export function useDashboardData() {
     if (timer) clearInterval(timer);
   });
 
-  return { snapshot, rows, period, loading, error };
+  return { snapshot, rows, routeGeometries, period, loading, error };
 }

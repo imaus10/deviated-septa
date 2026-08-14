@@ -2,11 +2,11 @@ import csv
 import io
 import time
 import zipfile
-from datetime import datetime, timezone
 
 import httpx
 
 from poller.db import copy_upsert_chunked, upsert_table
+from poller.route_geometries import regenerate_route_geometries
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
 
@@ -128,7 +128,6 @@ IMPORT_FUNCS = {
     "stops.txt": import_stops,
 }
 
-
 def is_static_loaded(db):
     with db.cursor() as cur:
         cur.execute("SELECT route_id FROM routes LIMIT 1")
@@ -197,6 +196,7 @@ def run(db, gtfs_zip=None):
 
 def run_and_record_freshness(db, gtfs_zip=None):
     counts = run(db, gtfs_zip)
+    regenerate_route_geometries(db)
     last_modified = get_freshness()
     update_freshness(db, last_modified)
     return counts

@@ -5,12 +5,16 @@ import "leaflet/dist/leaflet.css";
 
 const props = defineProps({
   routes: { type: Array, default: () => [] },
+  stops: { type: Array, default: () => [] },
+  geometries: { type: Array, default: () => [] },
 });
 
 const mapContainer = ref(null);
+const stopsVisible = ref(false);
+const STOPS_MIN_ZOOM = 14;
 let map = null;
-let routeLines = null;
 let lineLayer = null;
+let stopLayer = null;
 let animFrame = null;
 const routeLookup = computed(() => {
   const m = new Map();
@@ -62,11 +66,36 @@ function popupContent(r) {
     </div>`;
 }
 
+function stopPopupContent(stop) {
+  const otp = stop.on_time_percentage;
+  const pct = otp != null ? otp.toFixed(1) + "%" : "—";
+  const delay = formatDelay(stop.avg_delay_seconds);
+  const total = stop.total_observations || 0;
+  const early = stop.early_count || 0;
+  const onTime = stop.on_time_count || 0;
+  const late = stop.late_count || 0;
+  const earlyPct = total ? (early / total * 100).toFixed(0) : 0;
+  const onTimePct = total ? (onTime / total * 100).toFixed(0) : 0;
+  const latePct = total ? (late / total * 100).toFixed(0) : 0;
+  return `
+    <div class="popup-body">
+      <div class="popup-name">${stop.stop_name || stop.stop_id}</div>
+      <div class="popup-otp" style="color:${otpColor(otp)}">${pct}</div>
+      <div class="popup-row"><span class="popup-label">Avg delay</span><span>${delay}</span></div>
+      <div class="popup-row"><span class="popup-label">Observations</span><span>${total.toLocaleString()}</span></div>
+      <div class="popup-breakdown">
+        <span style="color:#f44336">${earlyPct}% early</span>
+        <span style="color:#4caf50">${onTimePct}% on time</span>
+        <span style="color:#ff9800">${latePct}% late</span>
+      </div>
+    </div>`;
+}
+
 function drawLines() {
-  if (!map || !routeLines) return;
+  if (!map) return;
   if (lineLayer) { map.removeLayer(lineLayer); lineLayer = null; }
   lineLayer = L.layerGroup().addTo(map);
-  for (const r of routeLines) {
+  for (const r of props.geometries) {
     const routeData = routeLookup.value.get(r.route_id);
     const color = otpColor(routeData ? routeData.on_time_percentage : null);
 
@@ -94,7 +123,53 @@ function drawLines() {
   }
 }
 
+function drawStops() {
+  if (!map) return;
+  if (stopLayer) { map.removeLayer(stopLayer); stopLayer = null; }
+  if (map.getZoom() < STOPS_MIN_ZOOM) {
+    stopsVisible.value = false;
+    return;
+  }
+  stopLayer = L.layerGroup().addTo(map);
+  stopsVisible.value = true;
+
+  for (const stop of props.stops) {
+    const lat = Number(stop.stop_lat);
+    const lon = Number(stop.stop_lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    const marker = L.circleMarker([lat, lon], {
+      radius: 4,
+      color: "#111827",
+      weight: 1,
+      fillColor: otpColor(stop.on_time_percentage),
+      fillOpacity: 0.92,
+      opacity: 0.9,
+    }).addTo(stopLayer);
+
+    marker.bindTooltip(stop.stop_name || stop.stop_id, { sticky: true, className: "route-tooltip" });
+    marker.bindPopup(stopPopupContent(stop), { className: "route-popup", closeButton: false });
+  }
+}
+
+function updateStopsVisibility() {
+  if (!map) return;
+  if (map.getZoom() >= STOPS_MIN_ZOOM) {
+    if (!stopLayer) drawStops();
+    else if (!map.hasLayer(stopLayer)) {
+      stopLayer.addTo(map);
+      stopsVisible.value = true;
+    }
+  } else if (stopLayer) {
+    map.removeLayer(stopLayer);
+    stopLayer = null;
+    stopsVisible.value = false;
+  }
+}
+
 watch(() => props.routes, drawLines, { deep: false });
+watch(() => props.stops, drawStops, { deep: false });
+watch(() => props.geometries, drawLines, { deep: false });
 
 onMounted(() => {
   map = L.map(mapContainer.value, {
@@ -102,12 +177,13 @@ onMounted(() => {
     zoom: 11,
     zoomControl: false,
   });
-  L.control.zoom({ position: "bottomright" }).addTo(map);
 
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
     attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OSM</a> &copy; <a href=\"https://carto.com/\">CARTO</a>",
     maxZoom: 18,
   }).addTo(map);
+  map.on("zoomend", updateStopsVisibility);
+  drawStops();
 
   fetch(import.meta.env.BASE_URL + "philly-boundary.json")
     .then((r) => {
@@ -132,16 +208,7 @@ onMounted(() => {
     })
     .catch((e) => console.error("Boundary fetch failed:", e));
 
-  fetch(import.meta.env.BASE_URL + "route-lines.json")
-    .then((r) => {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    })
-    .then((lines) => {
-      routeLines = lines;
-      drawLines();
-    })
-    .catch((e) => console.error("Route lines fetch failed:", e));
+  drawLines();
 });
 
 onUnmounted(() => {
@@ -154,13 +221,124 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="mapContainer" class="map-container"></div>
+  <div class="map-wrap">
+    <div ref="mapContainer" class="map-container"></div>
+    <div class="map-corner">
+      <div v-if="!stopsVisible" class="zoom-hint">
+        <span class="zoom-hint-icon">+</span>
+        <div class="zoom-hint-text">
+          <span class="zoom-hint-title">Zoom in to view stop-level data</span>
+        </div>
+      </div>
+      <div class="zoom-stack">
+        <button class="zoom-btn" title="Zoom in" aria-label="Zoom in" @click="map?.zoomIn()">+</button>
+        <button class="zoom-btn" title="Zoom out" aria-label="Zoom out" @click="map?.zoomOut()">−</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
+.map-wrap {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
 .map-container {
   width: 100%;
   height: 100%;
+}
+
+.map-corner {
+  position: absolute;
+  right: 0.625rem;
+  bottom: 1.7rem;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  pointer-events: none;
+}
+
+.map-corner > * {
+  pointer-events: auto;
+}
+
+.zoom-stack {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #333;
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(26, 26, 46, 0.85);
+  backdrop-filter: blur(4px);
+}
+
+.zoom-btn {
+  width: 2rem;
+  height: 2rem;
+  border: none;
+  background: transparent;
+  color: #ccc;
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.zoom-btn + .zoom-btn {
+  border-top: 1px solid #2a2a3e;
+}
+
+.zoom-btn:hover {
+  background: #2a2a3e;
+  color: #e0e0e0;
+}
+
+.zoom-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: rgba(22, 22, 42, 0.92);
+  border: 1px solid #333;
+  border-radius: 10px;
+  padding: 0.6rem 0.9rem;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  animation: zoom-hint-in 0.25s ease-out;
+}
+
+.zoom-hint-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  background: #3a3a5e;
+  color: #e0e0e0;
+  font-size: 1.1rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.zoom-hint-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.zoom-hint-title {
+  color: #e0e0e0;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+@keyframes zoom-hint-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 :deep(.route-popup .leaflet-popup-content-wrapper) {

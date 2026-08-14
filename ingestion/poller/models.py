@@ -2,7 +2,7 @@ from sqlalchemy import (
     Column, Integer, BigInteger, Float, Text, Date, ForeignKey,
     Index, UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy.dialects.postgresql import TIMESTAMP, JSONB
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -127,13 +127,65 @@ class HourlyRouteMetric(Base):
     )
 
 
+class DailyStopMetric(Base):
+    __tablename__ = "daily_stop_metrics"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    stop_id = Column(Text, nullable=False)
+    date = Column(Date, nullable=False)
+    total_observations = Column(Integer, nullable=False, default=0)
+    early_count = Column(Integer, nullable=False, default=0)
+    on_time_count = Column(Integer, nullable=False, default=0)
+    late_count = Column(Integer, nullable=False, default=0)
+    on_time_percentage = Column(Float, nullable=True)
+    avg_delay_seconds = Column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("stop_id", "date", name="uq_daily_stop_date"),
+    )
+
+
+class HourlyStopMetric(Base):
+    __tablename__ = "hourly_stop_metrics"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    stop_id = Column(Text, nullable=False)
+    date = Column(Date, nullable=False)
+    hour = Column(Integer, nullable=False)
+    total_observations = Column(Integer, nullable=False, default=0)
+    early_count = Column(Integer, nullable=False, default=0)
+    on_time_count = Column(Integer, nullable=False, default=0)
+    late_count = Column(Integer, nullable=False, default=0)
+    on_time_percentage = Column(Float, nullable=True)
+    avg_delay_seconds = Column(Float, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("stop_id", "date", "hour", name="uq_hourly_stop_date_hour"),
+    )
+
+
+class RouteGeometry(Base):
+    __tablename__ = "route_geometries"
+
+    route_id = Column(Text, primary_key=True)
+    route_short_name = Column(Text, nullable=True)
+    coordinates = Column(JSONB, nullable=True)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
 class LatestSnapshot(Base):
     __tablename__ = "latest_snapshot"
 
     period = Column(Text, primary_key=True)
-    route_id = Column(Text, primary_key=True)
+    entity_type = Column(Text, primary_key=True)
+    entity_id = Column(Text, primary_key=True)
+    route_id = Column(Text, nullable=True)
     route_name = Column(Text, nullable=True)
     route_type = Column(Integer, nullable=True)
+    stop_id = Column(Text, nullable=True)
+    stop_name = Column(Text, nullable=True)
+    stop_lat = Column(Float, nullable=True)
+    stop_lon = Column(Float, nullable=True)
     total_observations = Column(Integer, nullable=False, default=0)
     early_count = Column(Integer, nullable=False, default=0)
     on_time_count = Column(Integer, nullable=False, default=0)

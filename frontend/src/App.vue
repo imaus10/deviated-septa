@@ -5,10 +5,14 @@ import KpiHeader from "./components/KpiHeader.vue";
 import RouteTable from "./components/RouteTable.vue";
 import RouteMap from "./components/RouteMap.vue";
 
-const { rows, period, loading, error } = useDashboardData();
+const { rows, routeGeometries, period, loading, error } = useDashboardData();
 
-const allRoutes = computed(() =>
-  rows.value.filter((r) => r.route_type === 0 || r.route_type === 3),
+const routes = computed(() =>
+  rows.value.filter((r) => r.entity_type === "route" && [0, 3, 11].includes(r.route_type)),
+);
+
+const stops = computed(() =>
+  rows.value.filter((r) => r.entity_type === "stop" && r.stop_lat != null && r.stop_lon != null),
 );
 
 const periods = [
@@ -19,6 +23,7 @@ const periods = [
 ];
 
 const showList = ref(false);
+const listTab = ref("routes");
 </script>
 
 <template>
@@ -27,7 +32,7 @@ const showList = ref(false);
     <div v-else-if="loading" class="loading">Loading...</div>
     <template v-else>
       <div class="map-layer">
-        <RouteMap :routes="rows" />
+        <RouteMap :routes="routes" :stops="stops" :geometries="routeGeometries" />
       </div>
 
       <div class="title-bar"><span class="title-red">deviated</span> <span class="title-green">SEPTA</span></div>
@@ -44,7 +49,7 @@ const showList = ref(false);
         </button>
       </div>
       <div class="kpi-rail">
-        <KpiHeader :routes="rows" />
+        <KpiHeader :routes="routes" />
       </div>
 
       <button class="toggle-btn" :class="{ hidden: showList }" @click="showList = true">
@@ -53,10 +58,19 @@ const showList = ref(false);
 
       <div class="list-pane" :class="{ open: showList }">
         <div class="pane-header">
-          <h2>Route Ranking</h2>
+          <h2>{{ listTab === "routes" ? "Route Ranking" : "Stop Ranking" }}</h2>
           <button class="close-btn" @click="showList = false">✕</button>
         </div>
-        <RouteTable :routes="allRoutes" />
+        <div class="list-tabs">
+          <button class="list-tab" :class="{ active: listTab === 'routes' }" @click="listTab = 'routes'">
+            Routes
+          </button>
+          <button class="list-tab" :class="{ active: listTab === 'stops' }" @click="listTab = 'stops'">
+            Stops
+          </button>
+        </div>
+        <RouteTable v-if="listTab === 'routes'" :rows="routes" entity-type="route" />
+        <RouteTable v-else :rows="stops" entity-type="stop" />
       </div>
     </template>
   </div>
@@ -196,6 +210,33 @@ body {
 .pane-header h2 {
   font-size: 1.1rem;
   color: #aaa;
+}
+.list-tabs {
+  display: flex;
+  gap: 0.25rem;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid #2a2a3e;
+  border-radius: 8px;
+  padding: 0.25rem;
+  margin-bottom: 0.75rem;
+}
+.list-tab {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: #888;
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 0.35rem 0.5rem;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.list-tab:hover {
+  color: #ccc;
+}
+.list-tab.active {
+  background: #3a3a5e;
+  color: #e0e0e0;
 }
 .close-btn {
   background: none;

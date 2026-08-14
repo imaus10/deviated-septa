@@ -2,11 +2,12 @@
 import { ref, computed } from "vue";
 
 const props = defineProps({
-  routes: { type: Array, required: true },
+  rows: { type: Array, required: true },
+  entityType: { type: String, default: "route" },
 });
 
 const sortKey = ref("on_time_percentage");
-const sortDir = ref("desc");
+const sortDir = ref("asc");
 
 function setSort(key) {
   if (sortKey.value === key) {
@@ -19,12 +20,12 @@ function setSort(key) {
 
 function sortVal(r, key) {
   const v = r[key];
-  if (key === "route_id") return v ?? "";
+  if (key === "name") return displayName(r).toLowerCase();
   return v ?? 0;
 }
 
 const sorted = computed(() =>
-  [...props.routes].sort((a, b) => {
+  [...props.rows].sort((a, b) => {
     const va = sortVal(a, sortKey.value);
     const vb = sortVal(b, sortKey.value);
     return (va < vb ? -1 : va > vb ? 1 : 0) * (sortDir.value === "asc" ? 1 : -1);
@@ -52,6 +53,16 @@ function typeLabel(route_type) {
   return "—";
 }
 
+function displayName(row) {
+  if (props.entityType === "stop") return row.stop_name ?? row.stop_id;
+  return row.route_name ?? row.route_id;
+}
+
+function idTitle(row) {
+  if (props.entityType === "stop") return row.stop_id;
+  return row.route_id;
+}
+
 function otpColor(pct) {
   if (pct == null) return "#555";
   if (pct >= 85) return "#4caf50";
@@ -64,8 +75,8 @@ function otpColor(pct) {
   <table class="route-table">
     <thead>
       <tr>
-        <th class="sortable" @click="setSort('route_type')">Mode{{ sortIcon('route_type') }}</th>
-        <th class="sortable" @click="setSort('route_id')">Route{{ sortIcon('route_id') }}</th>
+        <th v-if="entityType === 'route'" class="sortable" @click="setSort('route_type')">Mode{{ sortIcon('route_type') }}</th>
+        <th class="sortable name-col" @click="setSort('name')">{{ entityType === "stop" ? "Stop" : "Route" }}{{ sortIcon('name') }}</th>
         <th class="sortable" @click="setSort('on_time_percentage')">On-time %{{ sortIcon('on_time_percentage') }}</th>
         <th class="sortable" @click="setSort('avg_delay_seconds')">Avg delay{{ sortIcon('avg_delay_seconds') }}</th>
         <th class="sortable" @click="setSort('on_time_count')">On-time{{ sortIcon('on_time_count') }}</th>
@@ -75,9 +86,9 @@ function otpColor(pct) {
       </tr>
     </thead>
     <tbody>
-      <tr v-for="r in sorted" :key="r.route_id">
-        <td class="type-cell">{{ typeLabel(r.route_type) }}</td>
-        <td class="route-id" :title="r.route_id">{{ r.route_name ?? r.route_id }}</td>
+      <tr v-for="r in sorted" :key="r.entity_id">
+        <td v-if="entityType === 'route'" class="type-cell">{{ typeLabel(r.route_type) }}</td>
+        <td class="entity-name" :title="idTitle(r)">{{ displayName(r) }}</td>
         <td>
           <div class="otp-cell">
             <div class="otp-track">
@@ -129,9 +140,12 @@ td {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.route-id {
+.entity-name {
   font-weight: 700;
   color: #e0e0e0;
+}
+.name-col {
+  min-width: 8rem;
 }
 .type-cell {
   color: #666;
