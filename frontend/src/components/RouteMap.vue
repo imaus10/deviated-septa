@@ -7,6 +7,7 @@ const props = defineProps({
   routes: { type: Array, default: () => [] },
   stops: { type: Array, default: () => [] },
   geometries: { type: Array, default: () => [] },
+  highlightStops: { type: Array, default: () => [] },
 });
 
 const mapContainer = ref(null);
@@ -15,6 +16,7 @@ const STOPS_MIN_ZOOM = 14;
 let map = null;
 let lineLayer = null;
 let stopLayer = null;
+let highlightLayer = null;
 let animFrame = null;
 const routeLookup = computed(() => {
   const m = new Map();
@@ -29,6 +31,20 @@ function otpColor(otp) {
   const t = Math.max(0, Math.min(100, otp)) / 100;
   const hue = t * 120;
   return `hsl(${hue}, 85%, 50%)`;
+}
+
+function otpHaloColor(otp) {
+  if (otp == null) return "rgba(144,164,174,0.5)";
+  const t = Math.max(0, Math.min(100, otp)) / 100;
+  const hue = t * 120;
+  return `hsla(${hue}, 85%, 55%, 0.5)`;
+}
+
+function otpEdgeColor(otp) {
+  if (otp == null) return "#90a4ae";
+  const t = Math.max(0, Math.min(100, otp)) / 100;
+  const hue = t * 120;
+  return `hsl(${hue}, 85%, 35%)`;
 }
 
 function formatDelay(seconds) {
@@ -150,6 +166,48 @@ function drawStops() {
     marker.bindTooltip(stop.stop_name || stop.stop_id, { sticky: true, className: "route-tooltip" });
     marker.bindPopup(stopPopupContent(stop), { className: "route-popup", closeButton: false });
   }
+  bringHighlightsToFront();
+}
+
+function drawHighlights() {
+  if (!map) return;
+  if (highlightLayer) { map.removeLayer(highlightLayer); highlightLayer = null; }
+  if (!props.highlightStops.length) return;
+
+  highlightLayer = L.layerGroup().addTo(map);
+  for (const stop of props.highlightStops) {
+    const lat = Number(stop.stop_lat);
+    const lon = Number(stop.stop_lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    const halo = L.circleMarker([lat, lon], {
+      radius: 9,
+      color: otpHaloColor(stop.on_time_percentage),
+      weight: 2,
+      fill: false,
+      interactive: false,
+      pane: "highlightPane",
+    }).addTo(highlightLayer);
+
+    const marker = L.circleMarker([lat, lon], {
+      radius: 6,
+      color: otpEdgeColor(stop.on_time_percentage),
+      weight: 1.5,
+      fillColor: otpColor(stop.on_time_percentage),
+      fillOpacity: 0.8,
+      pane: "highlightPane",
+    }).addTo(highlightLayer);
+
+    marker.bindTooltip(stop.stop_name || stop.stop_id, { sticky: true, className: "route-tooltip" });
+    marker.bindPopup(stopPopupContent(stop), { className: "route-popup", closeButton: false });
+  }
+  bringHighlightsToFront();
+}
+
+function bringHighlightsToFront() {
+  if (!map || !highlightLayer) return;
+  map.removeLayer(highlightLayer);
+  highlightLayer.addTo(map);
 }
 
 function updateStopsVisibility() {
@@ -170,6 +228,7 @@ function updateStopsVisibility() {
 watch(() => props.routes, drawLines, { deep: false });
 watch(() => props.stops, drawStops, { deep: false });
 watch(() => props.geometries, drawLines, { deep: false });
+watch(() => props.highlightStops, drawHighlights, { deep: false });
 
 onMounted(() => {
   map = L.map(mapContainer.value, {
@@ -177,6 +236,9 @@ onMounted(() => {
     zoom: 11,
     zoomControl: false,
   });
+
+  const highlightPane = map.createPane("highlightPane");
+  highlightPane.style.zIndex = 640;
 
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
     attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OSM</a> &copy; <a href=\"https://carto.com/\">CARTO</a>",
@@ -209,6 +271,7 @@ onMounted(() => {
     .catch((e) => console.error("Boundary fetch failed:", e));
 
   drawLines();
+  drawHighlights();
 });
 
 onUnmounted(() => {

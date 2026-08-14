@@ -3,7 +3,6 @@ import { ref, computed } from "vue";
 
 const props = defineProps({
   rows: { type: Array, required: true },
-  entityType: { type: String, default: "route" },
 });
 
 const sortKey = ref("on_time_percentage");
@@ -54,13 +53,7 @@ function typeLabel(route_type) {
 }
 
 function displayName(row) {
-  if (props.entityType === "stop") return row.stop_name ?? row.stop_id;
   return row.route_name ?? row.route_id;
-}
-
-function idTitle(row) {
-  if (props.entityType === "stop") return row.stop_id;
-  return row.route_id;
 }
 
 function otpColor(pct) {
@@ -75,8 +68,8 @@ function otpColor(pct) {
   <table class="route-table">
     <thead>
       <tr>
-        <th v-if="entityType === 'route'" class="sortable" @click="setSort('route_type')">Mode{{ sortIcon('route_type') }}</th>
-        <th class="sortable name-col" @click="setSort('name')">{{ entityType === "stop" ? "Stop" : "Route" }}{{ sortIcon('name') }}</th>
+        <th class="sortable" @click="setSort('route_type')">Mode{{ sortIcon('route_type') }}</th>
+        <th class="sortable name-col" @click="setSort('name')">Route{{ sortIcon('name') }}</th>
         <th class="sortable" @click="setSort('on_time_percentage')">On-time %{{ sortIcon('on_time_percentage') }}</th>
         <th class="sortable" @click="setSort('avg_delay_seconds')">Avg delay{{ sortIcon('avg_delay_seconds') }}</th>
         <th class="sortable" @click="setSort('on_time_count')">On-time{{ sortIcon('on_time_count') }}</th>
@@ -87,8 +80,8 @@ function otpColor(pct) {
     </thead>
     <tbody>
       <tr v-for="r in sorted" :key="r.entity_id">
-        <td v-if="entityType === 'route'" class="type-cell">{{ typeLabel(r.route_type) }}</td>
-        <td class="entity-name" :title="idTitle(r)">{{ displayName(r) }}</td>
+        <td class="type-cell">{{ typeLabel(r.route_type) }}</td>
+        <td class="entity-name" :title="r.route_id"><span class="name-text">{{ displayName(r) }}</span></td>
         <td>
           <div class="otp-cell">
             <div class="otp-track">
@@ -146,6 +139,13 @@ td {
 }
 .name-col {
   min-width: 8rem;
+}
+.name-text {
+  display: block;
+  max-width: 15rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .type-cell {
   color: #666;
