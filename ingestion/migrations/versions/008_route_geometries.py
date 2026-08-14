@@ -16,12 +16,12 @@ down_revision: Union[str, Sequence[str], None] = "000000000007"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# Table only — rows are populated at runtime by
+# Table only — rows are populated by 009_backfill_route_geometries on first
+# apply, and thereafter by the poller's
 # poller.route_geometries.regenerate_route_geometries(), which builds one
 # full-coverage "spider" polyline per bus/trolley route (every stop the route
 # serves lies on its line). The poller regenerates after every static-feed
-# import; existing DBs can be reconciled with a single explicit run of
-# `uv run python -m poller.route_geometries` (from ingestion/).
+# import.
 
 
 def upgrade() -> None:
