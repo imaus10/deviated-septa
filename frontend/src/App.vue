@@ -6,7 +6,7 @@ import RouteTable from "./components/RouteTable.vue";
 import RouteMap from "./components/RouteMap.vue";
 import TopStops from "./components/TopStops.vue";
 
-const { rows, routeGeometries, period, loading, error } = useDashboardData();
+const { rows, routeGeometries, dataRange, period, loading, error } = useDashboardData();
 
 const routes = computed(() =>
   rows.value.filter((r) => r.entity_type === "route" && [0, 3, 11].includes(r.route_type)),
@@ -16,12 +16,36 @@ const stops = computed(() =>
   rows.value.filter((r) => r.entity_type === "stop" && r.stop_lat != null && r.stop_lon != null),
 );
 
-const periods = [
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function parseRangeDate(raw) {
+  if (!raw) return null;
+  if (raw instanceof Date) return raw;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(raw));
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function fmtRangeDate(d) {
+  const base = `${MONTHS[d.getMonth()]} ${d.getDate()}`;
+  return d.getFullYear() === new Date().getFullYear() ? base : `${base}, ${d.getFullYear()}`;
+}
+
+const rangeCaption = computed(() => {
+  const min = parseRangeDate(dataRange.value?.min);
+  const max = parseRangeDate(dataRange.value?.max);
+  if (!min || !max) return null;
+  const days = Math.round((max - min) / 86400000) + 1;
+  const start = fmtRangeDate(min);
+  return days <= 1 ? `tracking since ${start}` : `tracking since ${start} · ${days} days`;
+});
+
+const periods = computed(() => [
   { value: "hourly", label: "Last Hour", title: "Stop arrivals refreshed in the last 60 minutes" },
   { value: "daily", label: "Today", title: "Today's service date" },
   { value: "weekly", label: "Last 7 Days", title: "Past 7 service dates including today" },
   { value: "all", label: "All Time", title: "All available observations since tracking began" },
-];
+]);
 
 const showList = ref(false);
 const showTopStops = ref(false);
@@ -154,17 +178,20 @@ function toggleTopStops() {
       </div>
 
       <div class="title-bar"><span class="title-red">deviated</span> <span class="title-green">SEPTA</span></div>
-      <div class="period-control">
-        <button
-          v-for="g in periods"
-          :key="g.value"
-          class="period-btn"
-          :class="{ active: period === g.value }"
-          :title="g.title"
-          @click="period = g.value"
-        >
-          {{ g.label }}
-        </button>
+      <div class="period-stack">
+        <div class="period-control">
+          <button
+            v-for="g in periods"
+            :key="g.value"
+            class="period-btn"
+            :class="{ active: period === g.value }"
+            :title="g.title"
+            @click="period = g.value"
+          >
+            {{ g.label }}
+          </button>
+        </div>
+        <div v-if="rangeCaption && period === 'all'" class="period-caption">{{ rangeCaption }}</div>
       </div>
       <div class="kpi-rail">
         <KpiHeader :routes="routes" />
@@ -235,12 +262,18 @@ body {
 }
 .title-red { color: #f44336; }
 .title-green { color: #4caf50; }
-.period-control {
+.period-stack {
   position: absolute;
-  top: 4rem;
+  top: 4.25rem;
   left: 50%;
   transform: translateX(-50%);
   z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+}
+.period-control {
   display: flex;
   gap: 0.25rem;
   background: rgba(26, 26, 46, 0.85);
@@ -258,6 +291,28 @@ body {
   border-radius: 5px;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
+}
+.period-caption {
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: #999;
+  background: rgba(26, 26, 46, 0.85);
+  padding: 0.18rem 0.7rem;
+  border-radius: 6px;
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+  white-space: nowrap;
+  animation: period-caption-in 0.25s ease-out;
+}
+@keyframes period-caption-in {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 .period-btn:hover {
   color: #ccc;

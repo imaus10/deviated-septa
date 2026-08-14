@@ -9,4 +9,5 @@ CREATE ROLE frontend_reader WITH LOGIN PASSWORD :'frontend_reader_password';
 
 GRANT USAGE ON SCHEMA public TO frontend_reader;
 GRANT SELECT ON latest_snapshot TO frontend_reader;
+GRANT SELECT ON daily_route_metrics TO frontend_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO frontend_reader;

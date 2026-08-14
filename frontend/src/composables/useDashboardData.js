@@ -7,6 +7,7 @@ const DEFAULT_PERIOD = "hourly";
 export function useDashboardData() {
   const snapshot = ref([]);
   const routeGeometries = ref([]);
+  const dataRange = ref(null);
   const period = ref(DEFAULT_PERIOD);
   const loading = ref(true);
   const error = ref(null);
@@ -38,6 +39,16 @@ export function useDashboardData() {
     } catch (e) {
       error.value = e.message;
     }
+
+    try {
+      const [range] = await sql`
+        SELECT min(date) AS min, max(date) AS max
+        FROM daily_route_metrics
+      `;
+      dataRange.value = range && range.min ? range : null;
+    } catch {
+      dataRange.value = null;
+    }
   }
 
   onMounted(() => {
@@ -49,5 +60,5 @@ export function useDashboardData() {
     if (timer) clearInterval(timer);
   });
 
-  return { snapshot, rows, routeGeometries, period, loading, error };
+  return { snapshot, rows, routeGeometries, dataRange, period, loading, error };
 }
