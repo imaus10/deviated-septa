@@ -106,6 +106,7 @@ function otpColor(pct) {
 <style scoped>
 .route-table {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: 0.72rem;
 }
@@ -119,6 +120,13 @@ th {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+th:nth-child(1) { width: 2rem; }
+th:nth-child(3) { width: 7rem; }
+th:nth-child(4) { width: 4.5rem; }
+th:nth-child(5) { width: 3.5rem; }
+th:nth-child(6) { width: 3rem; }
+th:nth-child(7) { width: 3rem; }
+th:nth-child(8) { width: 3.5rem; }
 th.sortable {
   cursor: pointer;
   user-select: none;
@@ -138,7 +146,6 @@ td {
   color: #e0e0e0;
 }
 .name-col {
-  min-width: 8rem;
 }
 .name-text {
   display: block;
