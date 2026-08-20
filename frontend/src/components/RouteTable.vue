@@ -49,6 +49,7 @@ function formatDelay(seconds) {
 function typeLabel(route_type) {
   if (route_type === 0) return "T";
   if (route_type === 3) return "B";
+  if (route_type === 11) return "TB";
   return "—";
 }
 
@@ -72,9 +73,6 @@ function otpColor(pct) {
         <th class="sortable name-col" @click="setSort('name')">Route{{ sortIcon('name') }}</th>
         <th class="sortable" @click="setSort('on_time_percentage')">On-time %{{ sortIcon('on_time_percentage') }}</th>
         <th class="sortable" @click="setSort('avg_delay_seconds')">Avg delay{{ sortIcon('avg_delay_seconds') }}</th>
-        <th class="sortable" @click="setSort('on_time_count')">On-time{{ sortIcon('on_time_count') }}</th>
-        <th class="sortable" @click="setSort('early_count')">Early{{ sortIcon('early_count') }}</th>
-        <th class="sortable" @click="setSort('late_count')">Late{{ sortIcon('late_count') }}</th>
         <th class="sortable" @click="setSort('total_observations')">Total{{ sortIcon('total_observations') }}</th>
       </tr>
     </thead>
@@ -94,9 +92,6 @@ function otpColor(pct) {
           </div>
         </td>
         <td>{{ formatDelay(r.avg_delay_seconds) }}</td>
-        <td>{{ (r.on_time_count ?? 0).toLocaleString() }}</td>
-        <td>{{ (r.early_count ?? 0).toLocaleString() }}</td>
-        <td>{{ (r.late_count ?? 0).toLocaleString() }}</td>
         <td>{{ (r.total_observations ?? 0).toLocaleString() }}</td>
       </tr>
     </tbody>
@@ -106,7 +101,6 @@ function otpColor(pct) {
 <style scoped>
 .route-table {
   width: 100%;
-  table-layout: fixed;
   border-collapse: collapse;
   font-size: 0.72rem;
 }
@@ -117,16 +111,7 @@ th {
   border-bottom: 1px solid #333;
   font-weight: 600;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
-th:nth-child(1) { width: 2rem; }
-th:nth-child(3) { width: 7rem; }
-th:nth-child(4) { width: 4.5rem; }
-th:nth-child(5) { width: 3.5rem; }
-th:nth-child(6) { width: 3rem; }
-th:nth-child(7) { width: 3rem; }
-th:nth-child(8) { width: 3.5rem; }
 th.sortable {
   cursor: pointer;
   user-select: none;
