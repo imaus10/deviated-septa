@@ -145,21 +145,13 @@ watch(period, () => {
 const TOP_STOPS_N = 20;
 const MIN_OBS = 10;
 
-function rankStops(list, dir) {
-  return [...list]
-    .filter((s) => (s.total_observations ?? 0) >= MIN_OBS && s.on_time_percentage != null)
-    .sort((a, b) =>
-      dir === "best"
-        ? b.on_time_percentage - a.on_time_percentage
-        : a.on_time_percentage - b.on_time_percentage,
-    )
-    .slice(0, TOP_STOPS_N)
-    .map((s) => ({ ...s, band: dir }));
-}
+const qualifiedStops = computed(() =>
+  stops.value.filter(
+    (s) => (s.total_observations ?? 0) >= MIN_OBS && s.avg_delay_seconds != null,
+  ),
+);
 
-const bestStops = computed(() => rankStops(stops.value, "best"));
-const worstStops = computed(() => rankStops(stops.value, "worst"));
-const topStops = computed(() => [...bestStops.value, ...worstStops.value]);
+const highlightedStops = ref([]);
 
 function toggleList() {
   showList.value = !showList.value;
@@ -182,7 +174,7 @@ function toggleTopStops() {
           :routes="routes"
           :stops="stops"
           :geometries="routeGeometries"
-          :highlight-stops="showTopStops ? topStops : []"
+          :highlight-stops="showTopStops ? highlightedStops : []"
           :selected-stop="selectedStop"
         />
       </div>
@@ -226,7 +218,7 @@ function toggleTopStops() {
           <button class="close-btn" @click="showList = false; showTopStops = false">✕</button>
         </div>
         <RouteTable v-if="showList" :rows="routes" />
-        <TopStops v-else-if="showTopStops" :best="bestStops" :worst="worstStops" @selectStop="selectedStop = $event" />
+        <TopStops v-else-if="showTopStops" :stops="qualifiedStops" :n="TOP_STOPS_N" @highlight="highlightedStops = $event" @selectStop="selectedStop = $event" />
       </div>
     </template>
   </div>
