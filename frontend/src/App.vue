@@ -49,6 +49,7 @@ const periods = computed(() => [
 
 const showList = ref(false);
 const showTopStops = ref(false);
+const selectedStop = ref(null);
 
 const toggleGroup = ref(null);
 
@@ -133,6 +134,14 @@ watch(
   { flush: "post" },
 );
 
+watch(showTopStops, (v) => {
+  if (!v) selectedStop.value = null;
+});
+
+watch(period, () => {
+  selectedStop.value = null;
+});
+
 const TOP_STOPS_N = 20;
 const MIN_OBS = 10;
 
@@ -174,6 +183,7 @@ function toggleTopStops() {
           :stops="stops"
           :geometries="routeGeometries"
           :highlight-stops="showTopStops ? topStops : []"
+          :selected-stop="selectedStop"
         />
       </div>
 
@@ -216,7 +226,7 @@ function toggleTopStops() {
           <button class="close-btn" @click="showList = false; showTopStops = false">✕</button>
         </div>
         <RouteTable v-if="showList" :rows="routes" />
-        <TopStops v-else-if="showTopStops" :best="bestStops" :worst="worstStops" />
+        <TopStops v-else-if="showTopStops" :best="bestStops" :worst="worstStops" @selectStop="selectedStop = $event" />
       </div>
     </template>
   </div>

@@ -8,6 +8,7 @@ const props = defineProps({
   stops: { type: Array, default: () => [] },
   geometries: { type: Array, default: () => [] },
   highlightStops: { type: Array, default: () => [] },
+  selectedStop: { type: Object, default: null },
 });
 
 const mapContainer = ref(null);
@@ -17,6 +18,7 @@ let map = null;
 let lineLayer = null;
 let stopLayer = null;
 let highlightLayer = null;
+let highlightMarkerMap = new Map();
 let animFrame = null;
 const routeLookup = computed(() => {
   const m = new Map();
@@ -172,6 +174,7 @@ function drawStops() {
 function drawHighlights() {
   if (!map) return;
   if (highlightLayer) { map.removeLayer(highlightLayer); highlightLayer = null; }
+  highlightMarkerMap = new Map();
   if (!props.highlightStops.length) return;
 
   highlightLayer = L.layerGroup().addTo(map);
@@ -200,6 +203,7 @@ function drawHighlights() {
 
     marker.bindTooltip(stop.stop_name || stop.stop_id, { sticky: true, className: "route-tooltip" });
     marker.bindPopup(stopPopupContent(stop), { className: "route-popup", closeButton: false });
+    highlightMarkerMap.set(stop.entity_id, marker);
   }
   bringHighlightsToFront();
 }
@@ -229,6 +233,20 @@ watch(() => props.routes, drawLines, { deep: false });
 watch(() => props.stops, drawStops, { deep: false });
 watch(() => props.geometries, drawLines, { deep: false });
 watch(() => props.highlightStops, drawHighlights, { deep: false });
+
+watch(() => props.selectedStop, (stop) => {
+  if (!map || !stop) return;
+  const marker = highlightMarkerMap.get(stop.entity_id);
+  if (!marker) return;
+  const latlng = marker.getLatLng();
+
+  if (!map.getBounds().contains(latlng)) {
+    map.once("moveend", () => marker.openPopup());
+    map.panTo(latlng);
+  } else {
+    marker.openPopup();
+  }
+});
 
 onMounted(() => {
   map = L.map(mapContainer.value, {

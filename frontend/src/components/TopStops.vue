@@ -4,6 +4,8 @@ defineProps({
   worst: { type: Array, default: () => [] },
 });
 
+const emit = defineEmits(["selectStop"]);
+
 function formatDelay(seconds) {
   if (seconds == null) return "—";
   const abs = Math.abs(seconds);
@@ -21,7 +23,7 @@ function formatDelay(seconds) {
       <h3 class="section-title best-title">Best Stops</h3>
       <table class="top-table">
         <tbody>
-          <tr v-for="(s, i) in best" :key="'b' + s.entity_id">
+          <tr v-for="(s, i) in best" :key="'b' + s.entity_id" class="clickable" @click="emit('selectStop', s)">
             <td class="rank">{{ i + 1 }}</td>
             <td class="name-cell" :title="s.stop_id">{{ s.stop_name || s.stop_id }}</td>
             <td class="otp best-otp">{{ s.on_time_percentage + '%' }}</td>
@@ -36,7 +38,7 @@ function formatDelay(seconds) {
       <h3 class="section-title worst-title">Worst Stops</h3>
       <table class="top-table">
         <tbody>
-          <tr v-for="(s, i) in worst" :key="'w' + s.entity_id">
+          <tr v-for="(s, i) in worst" :key="'w' + s.entity_id" class="clickable" @click="emit('selectStop', s)">
             <td class="rank">{{ i + 1 }}</td>
             <td class="name-cell" :title="s.stop_id">{{ s.stop_name || s.stop_id }}</td>
             <td class="otp worst-otp">{{ s.on_time_percentage + '%' }}</td>
@@ -109,6 +111,12 @@ function formatDelay(seconds) {
   color: #666;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+.clickable {
+  cursor: pointer;
+}
+.clickable:hover td {
+  background: #2a2a3e;
 }
 .empty {
   color: #888;
