@@ -306,7 +306,9 @@ onUnmounted(() => {
     <div ref="mapContainer" class="map-container"></div>
     <div class="map-corner">
       <div v-if="!stopsVisible" class="zoom-hint">
-        <span class="zoom-hint-icon">+</span>
+        <svg class="zoom-hint-icon" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" />
+        </svg>
         <div class="zoom-hint-text">
           <span class="zoom-hint-title">Zoom in to view stop-level data</span>
         </div>
@@ -392,16 +394,12 @@ onUnmounted(() => {
 }
 
 .zoom-hint-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
   width: 1.6rem;
   height: 1.6rem;
   border-radius: 50%;
   background: #3a3a5e;
   color: #e0e0e0;
-  font-size: 1.1rem;
-  font-weight: 700;
+  padding: 0.3rem;
   flex-shrink: 0;
 }
 
