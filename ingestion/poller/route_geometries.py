@@ -7,8 +7,7 @@ the GTFS static tables.
 Rebuild route_geometries from ingestion/:
     source ../.env && uv run python -m poller.route_geometries
 
-Idempotent — safe to re-run any time. The poller also regenerates automatically
-after every GTFS static-feed import (gtfs_static.run_and_record_freshness).
+Idempotent — safe to re-run any time.
 """
 
 import math

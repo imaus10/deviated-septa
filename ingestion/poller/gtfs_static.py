@@ -14,24 +14,27 @@ import csv
 import io
 import os
 import pathlib
-import time
 import zipfile
 
 import httpx
+
+from poller.constants import ROUTE_SCOPE_TYPES
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
 
 # Bus + trolley scope — matches the aggregation filter.
 # Type 0 = trolley (subway-surface), 3 = bus, 11 = trolleybus (59/66/75).
-_ROUTE_SCOPE_TYPES = {0, 3, 11}
 
 
 # ---------------------------------------------------------------------------
 # CSV helper
 # ---------------------------------------------------------------------------
 
-def _parse_csv(raw: str) -> list[dict[str, str]]:
-    return list(csv.DictReader(io.StringIO(raw)))
+def _parse_csv(raw: str, filter_fn=None):
+    reader = csv.DictReader(io.StringIO(raw))
+    if filter_fn:
+        return (row for row in reader if filter_fn(row))
+    return reader
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +67,7 @@ def _parse_routes(rows: list[dict]) -> dict[str, dict]:
     routes = {}
     for r in rows:
         rt = int(r.get("route_type", 3))
-        if rt not in _ROUTE_SCOPE_TYPES:
+        if rt not in ROUTE_SCOPE_TYPES:
             continue
         routes[r["route_id"]] = {
             "route_name": r.get("route_short_name", ""),
@@ -98,11 +101,10 @@ def _parse_stops(rows: list[dict]) -> dict[str, dict]:
     return stops
 
 
-def _parse_stop_times(rows: list[dict], trip_ids: set[str]) -> dict[tuple[str, int], dict]:
+def _parse_stop_times(rows) -> dict[tuple[str, int], dict]:
+    """Parse stop_times from a pre-filtered row stream."""
     stop_times = {}
     for r in rows:
-        if r["trip_id"] not in trip_ids:
-            continue
         key = (r["trip_id"], int(r["stop_sequence"]))
         stop_times[key] = {
             "arrival_time": r.get("arrival_time"),
@@ -156,8 +158,12 @@ def parse_zip(gtfs_zip: bytes) -> dict:
     # 3. Stops — all stops (unfiltered)
     stops = _parse_stops(_parse_csv(files.get("stops.txt", "")))
 
-    # 4. Stop times — filtered to bus/trolley trips
-    stop_times = _parse_stop_times(_parse_csv(files.get("stop_times.txt", "")), trip_ids)
+    # 4. Stop times — filtered to bus/trolley trips (streaming, low memory)
+    stop_times_rows = _parse_csv(
+        files.get("stop_times.txt", ""),
+        filter_fn=lambda r: r["trip_id"] in trip_ids,
+    )
+    stop_times = _parse_stop_times(stop_times_rows)
 
     # 5. Calendar — all
     calendar = _parse_calendar(_parse_csv(files.get("calendar.txt", "")))
@@ -192,13 +198,12 @@ def load_local(data_dir: str) -> dict:
     return parse_zip(zip_path.read_bytes())
 
 
-# get_stored_freshness() is defined in the DB layer below — handles both
-# string paths (local) and connection objects (Postgres).
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator — check freshness, download if needed, return parsed data
-# ---------------------------------------------------------------------------
+def get_stored_freshness(data_dir: str) -> str | None:
+    """Read the stored Last-Modified value from disk."""
+    freshness_path = pathlib.Path(data_dir) / "freshness.txt"
+    if not freshness_path.exists():
+        return None
+    return freshness_path.read_text().strip()
 
 def check_and_update(data_dir: str) -> tuple[dict, bool]:
     """Check if the GTFS feed has updated, download if so, return parsed data.
@@ -219,115 +224,3 @@ def check_and_update(data_dir: str) -> tuple[dict, bool]:
     _save_zip(data_dir, zip_bytes, remote_freshness)
     data = parse_zip(zip_bytes)
     return data, True
-
-
-# ---------------------------------------------------------------------------
-# DB import layer — temporary compatibility for local testing with Postgres.
-# These functions upsert parsed data into Postgres tables via db.py.
-# ---------------------------------------------------------------------------
-
-def _db_import_routes(conn, routes: dict[str, dict]):
-    from poller.db import upsert_table
-    rows = [{"route_id": k, "route_short_name": v["route_name"],
-             "route_long_name": None, "route_type": v["route_type"]}
-            for k, v in routes.items()]
-    upsert_table(conn, "routes", rows, pk_cols=["route_id"])
-
-
-def _db_import_trips(conn, trips: dict[str, dict]):
-    from poller.db import upsert_table
-    rows = [{"trip_id": k, "route_id": v["route_id"], "service_id": v["service_id"],
-             "direction_id": v["direction_id"], "trip_headsign": v["trip_headsign"]}
-            for k, v in trips.items()]
-    upsert_table(conn, "trips", rows, pk_cols=["trip_id"])
-
-
-def _db_import_stops(conn, stops: dict[str, dict]):
-    from poller.db import upsert_table
-    rows = [{"stop_id": k, "stop_name": v["stop_name"],
-             "stop_lat": v["stop_lat"], "stop_lon": v["stop_lon"]}
-            for k, v in stops.items()]
-    upsert_table(conn, "stops", rows, pk_cols=["stop_id"])
-
-
-def _db_import_stop_times(conn, stop_times: dict[tuple[str, int], dict]):
-    from poller.db import copy_upsert_chunked
-    def _rows():
-        for (trip_id, seq), v in stop_times.items():
-            yield {"trip_id": trip_id, "stop_sequence": seq,
-                   "arrival_time": v["arrival_time"], "departure_time": None,
-                   "stop_id": v["stop_id"], "pickup_type": None, "drop_off_type": None}
-    copy_upsert_chunked(conn, "stop_times", _rows(), pk_cols=["trip_id", "stop_sequence"])
-
-
-def _db_import_calendar(conn, calendar: dict[str, dict]):
-    from poller.db import upsert_table
-    rows = [{"service_id": k, **v} for k, v in calendar.items()]
-    upsert_table(conn, "calendar", rows, pk_cols=["service_id"])
-
-
-def run(db, gtfs_zip=None):
-    """Download (if needed), parse, and upsert GTFS static into Postgres."""
-    if gtfs_zip is None:
-        print("Downloading GTFS static data from SEPTA...", flush=True)
-        gtfs_zip = download_zip()
-
-    data = parse_zip(gtfs_zip)
-    t0 = time.perf_counter()
-    _db_import_routes(db, data["routes"])
-    print(f"  imported {len(data['routes'])} routes in {time.perf_counter() - t0:.1f}s", flush=True)
-    t0 = time.perf_counter()
-    _db_import_trips(db, data["trips"])
-    print(f"  imported {len(data['trips'])} trips in {time.perf_counter() - t0:.1f}s", flush=True)
-    t0 = time.perf_counter()
-    _db_import_stops(db, data["stops"])
-    print(f"  imported {len(data['stops'])} stops in {time.perf_counter() - t0:.1f}s", flush=True)
-    t0 = time.perf_counter()
-    _db_import_stop_times(db, data["stop_times"])
-    print(f"  imported {len(data['stop_times'])} stop_times in {time.perf_counter() - t0:.1f}s", flush=True)
-    t0 = time.perf_counter()
-    _db_import_calendar(db, data["calendar"])
-    print(f"  imported {len(data['calendar'])} calendar entries in {time.perf_counter() - t0:.1f}s", flush=True)
-
-    return {k: len(v) for k, v in data.items()}
-
-
-def is_static_loaded(db):
-    with db.cursor() as cur:
-        cur.execute("SELECT route_id FROM routes LIMIT 1")
-        return cur.fetchone() is not None
-
-
-def get_freshness() -> str:
-    return fetch_freshness()
-
-
-def get_stored_freshness(conn_or_data_dir) -> str | None:
-    """Read stored freshness from DB connection or local data directory path."""
-    if isinstance(conn_or_data_dir, str):
-        freshness_path = pathlib.Path(conn_or_data_dir) / "freshness.txt"
-        if not freshness_path.exists():
-            return None
-        return freshness_path.read_text().strip()
-    with conn_or_data_dir.cursor() as cur:
-        cur.execute("SELECT last_modified FROM service_cycle ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
-        return row[0] if row else None
-
-
-def update_freshness(conn, last_modified: str | None):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO service_cycle (last_modified, checked_at) VALUES (%s, NOW())",
-            (last_modified,),
-        )
-        conn.commit()
-
-
-def run_and_record_freshness(conn, gtfs_zip=None):
-    from poller.route_geometries import regenerate_route_geometries
-    counts = run(conn, gtfs_zip)
-    regenerate_route_geometries(conn)
-    last_modified = fetch_freshness()
-    update_freshness(conn, last_modified)
-    return counts

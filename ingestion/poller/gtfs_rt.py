@@ -1,10 +1,14 @@
-import io
 import logging
 from datetime import datetime, date, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import httpx
 from google.transit import gtfs_realtime_pb2
+
+from poller.constants import (
+    EARLY_TOLERANCE_SECONDS,
+    EASTERN,
+    LATE_TOLERANCE_SECONDS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -14,7 +18,6 @@ BUS_VEHICLE_POSITIONS = (
 )
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-EASTERN = ZoneInfo("America/New_York")
 
 
 def _parse_time_str(time_str: str) -> tuple[int, int, int, int]:
@@ -61,7 +64,13 @@ def parse_trip_updates(raw: bytes) -> gtfs_realtime_pb2.FeedMessage:
     return feed
 
 
-def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
+def extract_observations(feed, stop_times_data: dict) -> list[dict]:
+    """Extract observations from GTFS-RT feed.
+
+    Args:
+        stop_times_data: {(trip_id, stop_seq): {"arrival_time": str, "stop_id": str}}
+            as returned by gtfs_static.parse_zip()
+    """
     observations = []
 
     for entity in feed.entity:
@@ -74,10 +83,6 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
         if tu.trip.schedule_relationship == gtfs_realtime_pb2.TripDescriptor.CANCELED:
             continue
 
-        stop_times = stop_times_cache.get(trip_id)
-        if not stop_times:
-            continue
-
         vehicle_id = tu.vehicle.id if tu.vehicle.id else None
 
         for stu in tu.stop_time_update:
@@ -87,7 +92,7 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
             stop_seq = stu.stop_sequence
             predicted_ts = stu.arrival.time
 
-            scheduled_row = stop_times.get(stop_seq)
+            scheduled_row = stop_times_data.get((trip_id, stop_seq))
             if scheduled_row is None:
                 continue
 
@@ -120,99 +125,10 @@ def extract_observations(feed, stop_times_cache: dict) -> list[dict]:
     return observations
 
 
-def load_stop_times(conn, trip_ids: set[str]) -> dict:
-    cache: dict[str, dict[int, dict]] = {}
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT trip_id, stop_sequence, arrival_time, stop_id "
-            "FROM stop_times WHERE trip_id = ANY(%s)",
-            (list(trip_ids),),
-        )
-        for row in cur.fetchall():
-            tid = row[0]
-            seq = row[1]
-            if tid not in cache:
-                cache[tid] = {}
-            cache[tid][seq] = {
-                "arrival_time": row[2],
-                "stop_id": row[3],
-            }
-    return cache
-
-
-def update_predictions(conn, observations):
-    cols = [
-        "trip_id", "stop_sequence",
-        "predicted_time", "delay_seconds", "vehicle_id", "poll_timestamp",
-        "service_date",
-    ]
-
-    buf = io.StringIO()
-    for obs in observations:
-        row = [
-            str(obs["trip_id"]),
-            str(obs["stop_sequence"]),
-            obs["predicted_time"].isoformat() if obs["predicted_time"] else "\\N",
-            str(obs["delay_seconds"]) if obs["delay_seconds"] is not None else "\\N",
-            str(obs["vehicle_id"]) if obs["vehicle_id"] else "\\N",
-            obs["poll_timestamp"].isoformat() if obs["poll_timestamp"] else "\\N",
-            str(obs["service_date"]) if obs["service_date"] else "\\N",
-        ]
-        buf.write("\t".join(row) + "\n")
-    buf.seek(0)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "CREATE TEMP TABLE _pred_staging ("
-            "trip_id text, stop_sequence int, "
-            "predicted_time timestamptz, delay_seconds int, "
-            "vehicle_id text, poll_timestamp timestamptz, "
-            "service_date date"
-            ") ON COMMIT DROP"
-        )
-        cur.copy_from(buf, "_pred_staging", sep="\t", null="\\N", columns=cols)
-        cur.execute(
-            "INSERT INTO real_time_observations "
-            "    (trip_id, stop_sequence, predicted_time, delay_seconds, "
-            "     vehicle_id, poll_timestamp, service_date) "
-            "SELECT trip_id, stop_sequence, predicted_time, delay_seconds, "
-            "       vehicle_id, poll_timestamp, service_date "
-            "FROM _pred_staging "
-            "ON CONFLICT (trip_id, stop_sequence, service_date) "
-            "DO UPDATE SET "
-            "    predicted_time = EXCLUDED.predicted_time, "
-            "    delay_seconds  = EXCLUDED.delay_seconds, "
-            "    vehicle_id     = EXCLUDED.vehicle_id, "
-            "    poll_timestamp = EXCLUDED.poll_timestamp"
-        )
-    conn.commit()
-
-
-def build_aggregations(conn):
-    now = datetime.now(ZoneInfo("America/New_York"))
-    today_str = now.date().isoformat()
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT agg_daily(%s)", [today_str])
-        conn.commit()
-    print("  daily aggregation done")
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT agg_snapshot_daily(%s, %s)", [today_str, now.isoformat()])
-        conn.commit()
-    print("  daily snapshot done")
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT agg_snapshot_hourly(%s)", [now.isoformat()])
-        conn.commit()
-    print("  hourly snapshot done")
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT agg_snapshot_weekly(%s)", [now.isoformat()])
-        conn.commit()
-    print("  weekly snapshot done")
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT agg_snapshot_all(%s)", [now.isoformat()])
-        conn.commit()
-    print("  all-time snapshot done")
+def classify(delay: int) -> str:
+    """Classify delay into on-time category."""
+    if delay < EARLY_TOLERANCE_SECONDS:
+        return "early"
+    elif delay > LATE_TOLERANCE_SECONDS:
+        return "late"
+    return "on_time"

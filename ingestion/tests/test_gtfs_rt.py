@@ -5,6 +5,7 @@ from poller.gtfs_rt import (
     _parse_time_str,
     extract_observations,
     infer_service_date,
+    classify,
 )
 
 
@@ -100,10 +101,8 @@ def test_extract_observations_basic():
     stu.arrival.time = 1783374120  # 17:42 EDT (on time)
 
     cache = {
-        "t1": {
-            1: {"arrival_time": "17:40:00", "stop_id": "A"},
-            2: {"arrival_time": "17:42:00", "stop_id": "B"},
-        }
+        ("t1", 1): {"arrival_time": "17:40:00", "stop_id": "A"},
+        ("t1", 2): {"arrival_time": "17:42:00", "stop_id": "B"},
     }
 
     obs = extract_observations(feed, cache)
@@ -131,9 +130,7 @@ def test_extract_observations_after_midnight_gtfs_time():
     stu.arrival.time = predicted_ts
 
     cache = {
-        "t-midnight": {
-            1: {"arrival_time": "24:11:43", "stop_id": "A"},
-        }
+        ("t-midnight", 1): {"arrival_time": "24:11:43", "stop_id": "A"},
     }
 
     obs = extract_observations(feed, cache)
@@ -236,10 +233,8 @@ def test_extract_observations_midnight_crossing_stops():
     stu2.arrival.time = ts2
 
     cache = {
-        "t-cross": {
-            1: {"arrival_time": "23:59:00", "stop_id": "A"},
-            2: {"arrival_time": "24:01:00", "stop_id": "B"},
-        }
+        ("t-cross", 1): {"arrival_time": "23:59:00", "stop_id": "A"},
+        ("t-cross", 2): {"arrival_time": "24:01:00", "stop_id": "B"},
     }
 
     obs = extract_observations(feed, cache)
@@ -265,12 +260,26 @@ def test_extract_observations_exact_midnight():
     stu.arrival.time = predicted_ts
 
     cache = {
-        "t-midnight-exact": {
-            1: {"arrival_time": "24:00:00", "stop_id": "A"},
-        }
+        ("t-midnight-exact", 1): {"arrival_time": "24:00:00", "stop_id": "A"},
     }
 
     obs = extract_observations(feed, cache)
     assert len(obs) == 1
     assert obs[0]["service_date"] == date(2026, 7, 22)
     assert obs[0]["delay_seconds"] == 0
+
+
+def test_classify_early():
+    assert classify(-61) == "early"
+    assert classify(-3600) == "early"
+
+
+def test_classify_on_time():
+    assert classify(-60) == "on_time"
+    assert classify(0) == "on_time"
+    assert classify(300) == "on_time"
+
+
+def test_classify_late():
+    assert classify(301) == "late"
+    assert classify(3600) == "late"
