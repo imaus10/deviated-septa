@@ -6,3 +6,7 @@ __pycache__/
 .env
 ingestion/data/
 ingestion/state/
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/terraform.tfvars
