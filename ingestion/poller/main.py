@@ -1,13 +1,23 @@
-"""One poll cycle — runs entirely locally (no database).
+"""One poll cycle — runs entirely locally (no database), rolls up four
+periods, and pushes the public rollup to S3.
 
   1. Load/refresh GTFS static from the local zip
   2. Fetch GTFS-RT trip updates
   3. Extract observations, enrich with route/stop ids, UPSERT into SQLite
-  4. Build and write the current-day rollup (state/current.json)
-  5. Persist state.json (service date + last poll time)
+  4. Prune out-of-window service dates into the all-time baseline (fold +
+     delete), refresh the daily archive chronicle, upload changed archives
+  5. Build the 4-period current.json → write locally → S3 public/current.json
+  6. Persist state.json (service date + last poll time)
 
-Day closeout (daily JSON, parquet archive, weekly/all recompute) and S3
-upload are handled by the storage phase.
+Period semantics are data-driven, never wall-clock: current_service_date is
+the newest service date seen in the feed; 'week' reads the SQLite store over
+the last 7 service dates; 'all' = all-time baseline + whatever the store
+still holds. The store keeps only the 7-date window, so local disk stays
+bounded; S3 (state/daily/, state/all-baseline.json) is the eternal chronicle.
+
+Parquet raw archives, GTFS-static snapshots, and geometries.json are for
+later phases. Local state/ files are always the source of truth; S3 uploads
+are best-effort (warn, never crash the cycle).
 """
 
 import sys
@@ -15,15 +25,28 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 import poller.gtfs_rt as gtfs_rt
 import poller.gtfs_static as gtfs_static
+import poller.s3 as s3
 from poller.constants import EASTERN
-from poller.rollup import build_rollup, write_current
-from poller.state import ObservationsDB, load_state, save_state
+from poller.rollup import (
+    build_current,
+    prune_window,
+    refresh_daily_chronicle,
+    save_baseline,
+    write_json,
+)
+from poller.state import ObservationsDB, save_state
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 STATE_DIR = ROOT / "state"
+
+load_dotenv(ROOT.parent / ".env")
+
+CURRENT_CACHE_CONTROL = "max-age=55, stale-while-revalidate=5"
 
 
 def _log_time(label, elapsed):
@@ -32,6 +55,18 @@ def _log_time(label, elapsed):
 
 def _eastern_today() -> str:
     return datetime.now(EASTERN).date().isoformat()
+
+
+def _upload(key: str, path, **meta) -> None:
+    """Best-effort upload with a single retry; local file always stays truth."""
+    try:
+        s3.upload_file(path, key, **meta)
+    except Exception as e:
+        try:
+            s3.upload_file(path, key, **meta)
+            return
+        except Exception:
+            print(f"  [s3] upload failed for {key}: {e}", flush=True)
 
 
 def main():
@@ -105,24 +140,36 @@ def main():
     _log_time("extract observations", time.perf_counter() - t3)
     print(f"  {len(rows)} observations extracted", flush=True)
 
-    # 4. Advance service date, then persist to SQLite + rollup
+    # 4. Persist: prune the window, refresh the chronicle, roll up current.json
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = load_state(str(STATE_DIR))
-    today = _eastern_today()
-
-    if state.get("service_date") and state["service_date"] != today:
-        # Day closeout (daily JSON, parquet archive, weekly/all) is handled
-        # by the storage phase; prior-day rows are retained until then.
-        print(f"  service date rollover: {state['service_date']} -> {today}", flush=True)
-
     db = ObservationsDB(STATE_DIR / "observations.db")
     try:
         db.upsert(rows)
-        print(f"  observations total: {db.count()}", flush=True)
 
-        rollup = build_rollup(db, today, data)
-        write_current(rollup, str(STATE_DIR))
-        save_state(str(STATE_DIR), today, datetime.now(timezone.utc).timestamp())
+        present = {r["service_date"] for r in rows}
+        store_dates = [sd for sd, _ in db.service_date_stats()]
+        current_sd = (
+            max(present).isoformat()
+            if present
+            else (store_dates[-1] if store_dates else _eastern_today())
+        )
+        print(f"  service date: {current_sd}", flush=True)
+
+        baseline, pruned = prune_window(db, str(STATE_DIR), current_sd)
+        if pruned:
+            save_baseline(str(STATE_DIR), baseline)
+            _upload("state/all-baseline.json", STATE_DIR / "all-baseline.json")
+            print("  baseline rolled up for aged-out service dates", flush=True)
+
+        for sd in refresh_daily_chronicle(db, str(STATE_DIR), current_sd):
+            _upload(f"state/daily/{sd}.json", STATE_DIR / "daily" / f"{sd}.json")
+
+        current = build_current(db, data, str(STATE_DIR), current_sd=current_sd)
+        write_json(current, STATE_DIR / "current.json")
+        _upload("public/current.json", STATE_DIR / "current.json", cache_control=CURRENT_CACHE_CONTROL)
+
+        print(f"  observations total: {db.count()}", flush=True)
+        save_state(str(STATE_DIR), current_sd, datetime.now(timezone.utc).timestamp())
     finally:
         db.close()
 

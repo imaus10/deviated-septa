@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS observations (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_observations_routes ON observations (route_id, category);
 CREATE INDEX IF NOT EXISTS idx_observations_stops ON observations (stop_id, category);
+CREATE INDEX IF NOT EXISTS idx_observations_service_date ON observations (service_date);
+CREATE INDEX IF NOT EXISTS idx_observations_poll_ts ON observations (poll_timestamp);
 """
 
 
@@ -108,11 +110,15 @@ class ObservationsDB:
         ).fetchone()[0]
 
     def _rollup_by(self, column: str, service_date) -> dict[str, dict]:
+        return self._rollup_by_filter(column, "service_date = ?", (to_iso_date(service_date),))
+
+    def _rollup_by_filter(self, column: str, where: str, params) -> dict[str, dict]:
         rows = self.conn.execute(
             f"SELECT {column}, category, COUNT(*), SUM(delay_seconds) "
-            "FROM observations WHERE service_date = ? "
+            "FROM observations "
+            f"WHERE {where} "
             f"GROUP BY {column}, category",
-            (to_iso_date(service_date),),
+            params,
         ).fetchall()
 
         totals = {}
@@ -137,6 +143,36 @@ class ObservationsDB:
     def rollup_stops(self, service_date) -> dict[str, dict]:
         """Per-stop totals for a service date, keyed by stop_id."""
         return self._rollup_by("stop_id", service_date)
+
+    def rollup_routes_since(self, unix_ts) -> dict[str, dict]:
+        """Per-route totals for observations polled at/after unix_ts."""
+        return self._rollup_by_filter("route_id", "poll_timestamp >= ?", (int(unix_ts),))
+
+    def rollup_stops_since(self, unix_ts) -> dict[str, dict]:
+        """Per-stop totals for observations polled at/after unix_ts."""
+        return self._rollup_by_filter("stop_id", "poll_timestamp >= ?", (int(unix_ts),))
+
+    def _rollup_by_dates(self, column: str, dates) -> dict[str, dict]:
+        dates = [to_iso_date(d) for d in dates]
+        if not dates:
+            return {}
+        placeholders = ",".join("?" * len(dates))
+        return self._rollup_by_filter(column, f"service_date IN ({placeholders})", tuple(dates))
+
+    def rollup_routes_for_dates(self, dates) -> dict[str, dict]:
+        """Per-route totals over the given service dates (used by the week window)."""
+        return self._rollup_by_dates("route_id", dates)
+
+    def rollup_stops_for_dates(self, dates) -> dict[str, dict]:
+        """Per-stop totals over the given service dates."""
+        return self._rollup_by_dates("stop_id", dates)
+
+    def service_date_stats(self) -> list[tuple[str, int]]:
+        """(service_date, MAX(poll_timestamp)) per date, oldest first."""
+        return self.conn.execute(
+            "SELECT service_date, MAX(poll_timestamp) FROM observations "
+            "GROUP BY service_date ORDER BY service_date"
+        ).fetchall()
 
     def export_day(self, service_date) -> list[tuple]:
         """Full rows for a service date (used by the parquet archive pass)."""
