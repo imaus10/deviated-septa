@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 import poller.archives as archives
 import poller.s3 as s3
 from poller.gtfs_rt import classify
-from poller.gtfs_static import load_local
+from poller.gtfs_static import active_route_ids, load_local_metadata
 
 load_dotenv(INGESTION_DIR.parent / ".env")
 
@@ -187,20 +187,53 @@ def migrate_observations(conn, args: argparse.Namespace) -> None:
 # Registries (routes / stops)
 # ---------------------------------------------------------------------------
 
-def seed_registries(args: argparse.Namespace) -> None:
-    data = load_local(str(DATA_DIR))
-    routes, stops = archives.build_registries(data)
+def dropped_route_windows(conn, dropped_ids) -> dict[str, tuple[str, str]]:
+    """Observation-derived validity windows for dropped routes.
+
+    SEPTA keeps no public archive of past feeds, so a dropped route's real
+    window is the span it was actually observed: (MIN(service_date),
+    MAX(service_date)) from real_time_observations.
+    """
+    dropped_ids = list(dropped_ids)
+    if not dropped_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT t.route_id, MIN(o.service_date), MAX(o.service_date) "
+            "FROM real_time_observations o "
+            "JOIN trips t ON o.trip_id = t.trip_id "
+            "WHERE t.route_id = ANY(%s) "
+            "GROUP BY t.route_id",
+            (dropped_ids,),
+        )
+        return {
+            rid: (min_sd.isoformat(), max_sd.isoformat())
+            for rid, min_sd, max_sd in cur
+        }
+
+
+def seed_registries(conn, args: argparse.Namespace) -> None:
+    data = load_local_metadata(str(DATA_DIR))
+    active = active_route_ids(str(DATA_DIR))
+    dropped = set(data["routes"]) - active
+    windows = dropped_route_windows(conn, dropped)
+    routes, stops = archives.build_registries(
+        data,
+        active_routes=active,
+        route_windows=windows,
+    )
     valid_from = archives._calendar_start(data)
     archive_dir = STATE_DIR / "archive"
 
     if args.dry_run:
         log(f"[dry-run] would seed {len(routes)} routes, {len(stops)} stops "
-            f"(valid_from={valid_from}, valid_to=NULL)")
+            f"(valid_from={valid_from}); {len(windows)} dropped-route windows: "
+            f"{sorted(windows)}")
         return
 
     routes_path = archives.write_routes_registry(routes, str(archive_dir))
     s3.upload_file(routes_path, "archive/routes.parquet", content_type=PARQUET_CONTENT_TYPE)
-    log(f"routes.parquet: {len(routes)} routes -> uploaded (local kept)")
+    log(f"routes.parquet: {len(routes)} routes ({len(windows)} closed) -> uploaded (local kept)")
 
     stops_path = archives.write_stops_registry(stops, str(archive_dir))
     s3.upload_file(stops_path, "archive/stops.parquet", content_type=PARQUET_CONTENT_TYPE)
@@ -216,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = _connect()
     try:
-        seed_registries(args)
+        seed_registries(conn, args)
         migrate_observations(conn, args)
     finally:
         conn.close()

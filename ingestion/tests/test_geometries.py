@@ -1,6 +1,26 @@
 from poller.route_geometries import build_geometries, _spider_order
 
 
+class _DictStatic:
+    """Duck-typed StaticDB stand-in — streams stop_times/trips from a fixture dict."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def iter_stop_times(self):
+        for (trip_id, seq), v in sorted(self._data["stop_times"].items()):
+            yield trip_id, seq, v["arrival_time"], v["stop_id"]
+
+    def iter_trips(self):
+        for trip_id, v in self._data["trips"].items():
+            yield trip_id, v["route_id"]
+
+
+def _build(data):
+    metadata = {"routes": data["routes"], "stops": data["stops"]}
+    return build_geometries(_DictStatic(data), metadata)
+
+
 def _data():
     return {
         "routes": {
@@ -30,7 +50,7 @@ def _data():
 
 class TestBuildGeometries:
     def test_emits_route_with_ordered_coordinates(self):
-        geo = build_geometries(_data())
+        geo = _build(_data())
         by_id = {g["route_id"]: g for g in geo}
         assert "42" in by_id
         assert by_id["42"]["route_name"] == "42"
@@ -42,14 +62,14 @@ class TestBuildGeometries:
         ]
 
     def test_sorted_by_route_id(self):
-        geo = build_geometries(_data())
+        geo = _build(_data())
         assert [g["route_id"] for g in geo] == sorted(g["route_id"] for g in geo)
 
     def test_skips_route_with_fewer_than_two_coords(self):
         data = _data()
         # give "10" only a single stop (A) -> no polyline
         data["stop_times"] = {k: v for k, v in data["stop_times"].items() if k != ("t2", 2)}
-        geo = build_geometries(data)
+        geo = _build(data)
         assert all(g["route_id"] != "10" for g in geo)
 
     def test_skips_missing_coords_and_missing_stoptime(self):
@@ -59,7 +79,7 @@ class TestBuildGeometries:
             ("t1", 1): {"arrival_time": "08:10:00", "stop_id": "NOLAT"},
             ("t1", 2): {"arrival_time": "08:15:00", "stop_id": "GHOST"},
         }
-        geo = build_geometries(data)
+        geo = _build(data)
         assert all(g["route_id"] != "42" for g in geo)
 
 

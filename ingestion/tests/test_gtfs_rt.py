@@ -9,6 +9,16 @@ from poller.gtfs_rt import (
 )
 
 
+class _FakeStatic:
+    """Minimal stand-in for gtfs_static.StaticDB — point stop_time lookups only."""
+
+    def __init__(self, cache):
+        self._cache = cache
+
+    def stop_time(self, trip_id, stop_sequence):
+        return self._cache.get((trip_id, stop_sequence))
+
+
 def test_parse_time_str_normal():
     assert _parse_time_str("12:30:45") == (0, 12, 30, 45)
 
@@ -105,7 +115,7 @@ def test_extract_observations_basic():
         ("t1", 2): {"arrival_time": "17:42:00", "stop_id": "B"},
     }
 
-    obs = extract_observations(feed, cache)
+    obs = extract_observations(feed, _FakeStatic(cache))
     assert len(obs) == 2
     assert obs[0]["trip_id"] == "t1"
     assert obs[0]["stop_sequence"] == 1
@@ -133,7 +143,7 @@ def test_extract_observations_after_midnight_gtfs_time():
         ("t-midnight", 1): {"arrival_time": "24:11:43", "stop_id": "A"},
     }
 
-    obs = extract_observations(feed, cache)
+    obs = extract_observations(feed, _FakeStatic(cache))
 
     assert len(obs) == 1
     assert obs[0]["service_date"] == date(2026, 7, 22)
@@ -153,7 +163,7 @@ def test_extract_observations_cancelled():
         gtfs_realtime_pb2.TripDescriptor.CANCELED
     )
 
-    obs = extract_observations(feed, {})
+    obs = extract_observations(feed, _FakeStatic({}))
     assert len(obs) == 0
 
 
@@ -167,7 +177,7 @@ def test_extract_observations_missing_cache():
     e = feed.entity.add()
     e.trip_update.trip.trip_id = "unknown_trip"
 
-    obs = extract_observations(feed, {})
+    obs = extract_observations(feed, _FakeStatic({}))
     assert len(obs) == 0
 
 
@@ -237,7 +247,7 @@ def test_extract_observations_midnight_crossing_stops():
         ("t-cross", 2): {"arrival_time": "24:01:00", "stop_id": "B"},
     }
 
-    obs = extract_observations(feed, cache)
+    obs = extract_observations(feed, _FakeStatic(cache))
     assert len(obs) == 2
     assert obs[0]["service_date"] == date(2026, 7, 22)
     assert obs[1]["service_date"] == date(2026, 7, 22)
@@ -263,7 +273,7 @@ def test_extract_observations_exact_midnight():
         ("t-midnight-exact", 1): {"arrival_time": "24:00:00", "stop_id": "A"},
     }
 
-    obs = extract_observations(feed, cache)
+    obs = extract_observations(feed, _FakeStatic(cache))
     assert len(obs) == 1
     assert obs[0]["service_date"] == date(2026, 7, 22)
     assert obs[0]["delay_seconds"] == 0

@@ -21,6 +21,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Write/read chunk size for observations. Row groups bound decompressed memory
+# during streaming reads (a 1 GB Pi restores date-by-date), so each archive is
+# split into ~200K-row groups and streamed one at a time over S3 range reads.
+ROW_GROUP_SIZE = 200_000
+STREAM_BATCH_SIZE = ROW_GROUP_SIZE
+
 # Tuples come from ObservationsDB.export_day() in this exact column order.
 OBSERVATION_COLUMNS = (
     "trip_id",
@@ -125,33 +131,69 @@ def _calendar_start(data) -> str | None:
     return f"{earliest[:4]}-{earliest[4:6]}-{earliest[6:8]}"
 
 
-def build_registries(data) -> tuple[dict, dict]:
-    """Build route/stop registry dicts from a static feed dict.
+def build_registries(data, *, active_routes=None, existing_routes=None,
+                     route_windows=None, existing_stops=None) -> tuple[dict, dict]:
+    """Build consolidation-aware registry dicts from a static feed dict.
 
-    Returns (routes, stops) shaped for write_routes_registry/write_stops_registry,
-    with present ids open-ended (valid_from = feed calendar start, valid_to = NULL).
+    Routes:
+      - active ids (have scoped trips): open-ended (valid_to = NULL). valid_from
+        is preserved from the existing ledger row, or the feed calendar start
+        for new ids.
+      - inactive feed ids with a `route_windows` entry {rid: (valid_from, valid_to)}:
+        closed. valid_from falls back to the existing row's valid_from when the
+        window's valid_from is None (poller refresh), or is set explicitly
+        (migration — observation-derived MIN).
+      - ids only in `existing_routes`: carried forward unchanged (never deleted,
+        never reopened once closed).
+    Stops: every feed stop open-ended (valid_from preserved from existing), plus
+    existing rows carried forward. No stop drop-window logic yet (see Commit 6 §5).
+
+    Returns (routes, stops) shaped for write_routes_registry/write_stops_registry.
     """
     valid_from = _calendar_start(data)
+    routes_meta = data.get("routes", {})
+    stops_meta = data.get("stops", {})
+    active_routes = set(active_routes) if active_routes is not None else set(routes_meta)
+    existing_routes = existing_routes or {}
+    existing_stops = existing_stops or {}
+    windows = route_windows or {}
 
-    routes = {
-        rid: {
-            "name": v.get("route_name", ""),
-            "route_type": v.get("route_type"),
-            "valid_from": valid_from,
+    routes = {}
+    for rid in active_routes & set(routes_meta):
+        prev = existing_routes.get(rid, {})
+        routes[rid] = {
+            "name": routes_meta[rid].get("route_name", ""),
+            "route_type": routes_meta[rid].get("route_type"),
+            "valid_from": prev.get("valid_from", valid_from),
             "valid_to": None,
         }
-        for rid, v in data.get("routes", {}).items()
-    }
-    stops = {
-        sid: {
+    for rid, (win_from, win_to) in windows.items():
+        if rid in routes:
+            continue
+        prev = existing_routes.get(rid, {})
+        routes[rid] = {
+            "name": routes_meta.get(rid, {}).get("route_name", ""),
+            "route_type": routes_meta.get(rid, {}).get("route_type"),
+            "valid_from": win_from or prev.get("valid_from", valid_from),
+            "valid_to": win_to,
+        }
+    for rid, row in existing_routes.items():
+        if rid not in routes:
+            routes[rid] = dict(row)
+
+    stops = {}
+    for sid, v in stops_meta.items():
+        prev = existing_stops.get(sid, {})
+        stops[sid] = {
             "name": v.get("stop_name", ""),
             "stop_lat": v.get("stop_lat"),
             "stop_lon": v.get("stop_lon"),
-            "valid_from": valid_from,
+            "valid_from": prev.get("valid_from", valid_from),
             "valid_to": None,
         }
-        for sid, v in data.get("stops", {}).items()
-    }
+    for sid, row in existing_stops.items():
+        if sid not in stops:
+            stops[sid] = dict(row)
     return routes, stops
 
 
@@ -173,13 +215,50 @@ def _atomic_write(table: pa.Table, target_dir: str, filename: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     out = d / filename
     tmp = d / f".{filename}.tmp"
-    pq.write_table(table, tmp)
+    pq.write_table(
+        table,
+        tmp,
+        compression="zstd",
+        row_group_size=ROW_GROUP_SIZE,
+        write_page_checksum=True,
+    )
     tmp.replace(out)
     return out
 
 
-def read_observation(path) -> pa.Table:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"no archive at {p}")
-    return pq.read_table(p)
+def read_observation(path, filesystem=None) -> pa.Table:
+    """Read a full observation archive as one Arrow table.
+
+    `path` is a local file path when filesystem is None, else an S3 key.
+    """
+    if filesystem is None:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"no archive at {p}")
+        return pq.read_table(p)
+    return pq.read_table(path, filesystem=filesystem)
+
+
+def read_registry(path, filesystem=None) -> dict[str, dict]:
+    """Read a registry file into {id: {column: value}} (valid_to None or a date str).
+
+    Used by the poller's static-refresh path to merge over the existing ledger
+    instead of overwriting it (preserving closed drop windows).
+    """
+    table = read_observation(path, filesystem=filesystem)
+    cols = table.column_names
+    out: dict[str, dict] = {}
+    for values in zip(*[table.column(c).to_pylist() for c in cols]):
+        row = dict(zip(cols, values))
+        out[row["id"]] = row
+    return out
+
+
+def stream_observation(path, filesystem=None):
+    """Yield observation archives as RecordBatch chunks (bounded memory).
+
+    Streams via iter_batches (one row group in flight at a time); `path` is a
+    local file path when filesystem is None, else an S3 key.
+    """
+    parquet = pq.ParquetFile(path, filesystem=filesystem)
+    yield from parquet.iter_batches(batch_size=STREAM_BATCH_SIZE)

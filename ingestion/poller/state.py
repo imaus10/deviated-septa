@@ -99,6 +99,33 @@ class ObservationsDB:
         )
         self.conn.commit()
 
+    def load_archive(self, rows: list[tuple]) -> None:
+        """Bulk-insert archive-shaped rows (predicted_time/poll_timestamp int).
+
+        `rows` are the OBSERVATION_COLUMNS tuples read from a parquet archive,
+        where predicted_time/poll_timestamp are already unix ints — inserted
+        verbatim (unlike upsert, which accepts datetimes). Used by restore to
+        (re)build the store from the S3 ledger.
+        """
+        if not rows:
+            return
+        self.conn.executemany(
+            "INSERT INTO observations (trip_id, stop_sequence, service_date, "
+            "  route_id, stop_id, delay_seconds, category, vehicle_id, "
+            "  predicted_time, poll_timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (trip_id, stop_sequence, service_date) DO UPDATE SET "
+            "  route_id=excluded.route_id, "
+            "  stop_id=excluded.stop_id, "
+            "  delay_seconds=excluded.delay_seconds, "
+            "  category=excluded.category, "
+            "  vehicle_id=excluded.vehicle_id, "
+            "  predicted_time=excluded.predicted_time, "
+            "  poll_timestamp=excluded.poll_timestamp",
+            rows,
+        )
+        self.conn.commit()
+
     def count(self, service_date=None) -> int:
         if service_date is None:
             return self.conn.execute(
@@ -173,6 +200,19 @@ class ObservationsDB:
             "SELECT service_date, MAX(poll_timestamp) FROM observations "
             "GROUP BY service_date ORDER BY service_date"
         ).fetchall()
+
+    def last_service_date_for_routes(self, route_ids) -> dict[str, str]:
+        """Newest service_date per route_id — closes dropped routes on static refresh."""
+        route_ids = [r for r in route_ids if r]
+        if not route_ids:
+            return {}
+        placeholders = ",".join("?" * len(route_ids))
+        rows = self.conn.execute(
+            f"SELECT route_id, MAX(service_date) FROM observations "
+            f"WHERE route_id IN ({placeholders}) GROUP BY route_id",
+            route_ids,
+        ).fetchall()
+        return {rid: sd for rid, sd in rows}
 
     def export_day(self, service_date) -> list[tuple]:
         """Full rows for a service date (used by the parquet archive pass)."""

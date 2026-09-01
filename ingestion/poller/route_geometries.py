@@ -4,8 +4,8 @@ Builds one full-coverage polyline per bus/trolley route (every stop the route
 serves lies on its line) using a "spider" walk over the stop graph derived from
 the GTFS static tables.
 
-This module operates on the local static feed dict (post-Neon) — no database.
-The poller calls `build_geometries(data)` on static refresh to emit
+This module operates on the local static feed (post-Neon) — no database. The
+poller calls `build_geometries(static, metadata)` on static refresh to emit
 `public/geometries.json`.
 """
 
@@ -75,32 +75,41 @@ def _component_chain(comp, graph, start):
     return chain
 
 
-def _load_route_geometry_inputs(data):
-    """Return per-route trip stop-sequences + stop graph from a static feed dict."""
-    route_names = {rid: v.get("route_name", "") for rid, v in data["routes"].items()}
+def _load_route_geometry_inputs(static, metadata):
+    """Return per-route trip stop-sequences + stop graph.
+
+    Routes/stops come from the tiny in-memory metadata dict; stop_times/trips
+    stream from StaticDB (iter_stop_times is already ordered by
+    trip_id, stop_sequence), so stop sequences fold per-trip with no global
+    by_trip dict — peak memory stays bounded on refresh.
+    """
+    route_names = {rid: v.get("route_name", "") for rid, v in metadata["routes"].items()}
 
     stop_coords = {
         sid: (v["stop_lat"], v["stop_lon"])
-        for sid, v in data["stops"].items()
+        for sid, v in metadata["stops"].items()
         if v.get("stop_lat") is not None and v.get("stop_lon") is not None
     }
 
-    by_trip = defaultdict(list)
-    for (trip_id, stop_seq), st in data["stop_times"].items():
-        by_trip[trip_id].append((stop_seq, st["stop_id"]))
-    for trip_id, entries in by_trip.items():
-        entries.sort(key=lambda e: e[0])
+    trip_route = {trip_id: route_id for trip_id, route_id in static.iter_trips()}
 
     trips_by_route = defaultdict(dict)
-    for trip_id, trip in data["trips"].items():
-        route_id = trip["route_id"]
-        seq = [
-            stop_id
-            for _seq, stop_id in by_trip.get(trip_id, ())
-            if stop_id in stop_coords
-        ]
-        if seq:
-            trips_by_route[route_id].setdefault(trip_id, []).extend(seq)
+    cur_trip = None
+    cur_seq = []
+    for trip_id, _stop_seq, _arrival, stop_id in static.iter_stop_times():
+        if trip_id != cur_trip:
+            if cur_trip is not None and cur_seq:
+                route_id = trip_route.get(cur_trip)
+                if route_id is not None:
+                    trips_by_route[route_id][cur_trip] = cur_seq
+            cur_trip = trip_id
+            cur_seq = []
+        if stop_id in stop_coords:
+            cur_seq.append(stop_id)
+    if cur_trip is not None and cur_seq:
+        route_id = trip_route.get(cur_trip)
+        if route_id is not None:
+            trips_by_route[route_id][cur_trip] = cur_seq
 
     route_graphs = {}
     for route_id, trips in trips_by_route.items():
@@ -190,13 +199,13 @@ def _spider_order(graph, trips, stop_coords):
     return order
 
 
-def build_geometries(data) -> list[dict]:
+def build_geometries(static, metadata) -> list[dict]:
     """One polyline per bus/trolley route, sorted by route_id.
 
     Returns [{route_id, route_name, coordinates}] where coordinates is a
     [lat, lon] pair list, dropping routes with fewer than 2 stops (no line).
     """
-    route_names, stop_coords, trips_by_route, route_graphs = _load_route_geometry_inputs(data)
+    route_names, stop_coords, trips_by_route, route_graphs = _load_route_geometry_inputs(static, metadata)
 
     out = []
     for route_id in sorted(route_names):

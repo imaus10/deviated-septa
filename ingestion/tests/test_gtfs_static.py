@@ -3,7 +3,14 @@ import csv
 import zipfile
 import pytest
 
-from poller.gtfs_static import parse_zip, load_local, get_stored_freshness, _save_zip
+from poller.gtfs_static import (
+    StaticDB,
+    active_route_ids,
+    get_stored_freshness,
+    import_to_sqlite,
+    load_local_metadata,
+    _save_zip,
+)
 
 
 def _csv_bytes(rows: list[dict]) -> bytes:
@@ -85,144 +92,162 @@ def make_test_zip(
     return outer_buf.getvalue()
 
 
-# --- Route parsing ---
+@pytest.fixture
+def static(tmp_path):
+    """Build a StaticDB from a fixture zip written to a tmp data dir."""
+    data_dir = tmp_path / "gtfs-static"
+    data_dir.mkdir()
+    (data_dir / "latest.zip").write_bytes(make_test_zip())
+    db_path = tmp_path / "static.db"
+    import_to_sqlite(str(data_dir), str(db_path))
+    s = StaticDB(str(db_path))
+    yield s
+    s.close()
+
+
+def _metadata(tmp_path, **kwargs):
+    data_dir = tmp_path / "gtfs-static"
+    data_dir.mkdir()
+    (data_dir / "latest.zip").write_bytes(make_test_zip(**kwargs))
+    return load_local_metadata(str(data_dir))
+
+
+# --- Route parsing (metadata) ---
 
 class TestParseRoutes:
-    def test_includes_bus(self):
-        result = parse_zip(make_test_zip())
-        assert "bus42" in result["routes"]
+    def test_includes_bus(self, tmp_path):
+        assert "bus42" in _metadata(tmp_path)["routes"]
 
-    def test_includes_trolley(self):
-        result = parse_zip(make_test_zip())
-        assert "trolley10" in result["routes"]
+    def test_includes_trolley(self, tmp_path):
+        assert "trolley10" in _metadata(tmp_path)["routes"]
 
-    def test_excludes_rail(self):
-        result = parse_zip(make_test_zip())
-        assert "rail100" not in result["routes"]
+    def test_excludes_rail(self, tmp_path):
+        assert "rail100" not in _metadata(tmp_path)["routes"]
 
-    def test_route_fields(self):
-        result = parse_zip(make_test_zip())
-        r = result["routes"]["bus42"]
+    def test_route_fields(self, tmp_path):
+        r = _metadata(tmp_path)["routes"]["bus42"]
         assert r["route_name"] == "42"
         assert r["route_type"] == 3
 
-    def test_no_bus_or_trolley(self):
+    def test_no_bus_or_trolley(self, tmp_path):
         routes = [{"route_id": "r1", "route_short_name": "1", "route_long_name": "Rail", "route_type": "1"}]
-        result = parse_zip(make_test_zip(routes=routes))
-        assert result["routes"] == {}
+        assert _metadata(tmp_path, routes=routes)["routes"] == {}
 
 
-# --- Trip parsing ---
-
-class TestParseTrips:
-    def test_includes_bus_trips(self):
-        result = parse_zip(make_test_zip())
-        assert "t1" in result["trips"]
-
-    def test_includes_trolley_trips(self):
-        result = parse_zip(make_test_zip())
-        assert "t2" in result["trips"]
-
-    def test_excludes_rail_trips(self):
-        result = parse_zip(make_test_zip())
-        assert "t3" not in result["trips"]
-
-    def test_trip_route_id(self):
-        result = parse_zip(make_test_zip())
-        assert result["trips"]["t1"]["route_id"] == "bus42"
-
-    def test_trip_fields(self):
-        result = parse_zip(make_test_zip())
-        t = result["trips"]["t1"]
-        assert t["direction_id"] == 0
-        assert t["trip_headsign"] == "Outbound"
-
-
-# --- Stop parsing ---
+# --- Stop parsing (metadata) ---
 
 class TestParseStops:
-    def test_includes_all_stops(self):
+    def test_includes_all_stops(self, tmp_path):
         """Stops are NOT filtered — a stop used by both bus and rail is included."""
-        result = parse_zip(make_test_zip())
-        assert "S1" in result["stops"]
-        assert "S2" in result["stops"]
-        assert "S3" in result["stops"]
+        stops = _metadata(tmp_path)["stops"]
+        assert "S1" in stops
+        assert "S2" in stops
+        assert "S3" in stops
 
-    def test_stop_fields(self):
-        result = parse_zip(make_test_zip())
-        s = result["stops"]["S1"]
+    def test_stop_fields(self, tmp_path):
+        s = _metadata(tmp_path)["stops"]["S1"]
         assert s["stop_name"] == "Front & Chestnut"
         assert s["stop_lat"] == pytest.approx(39.952)
         assert s["stop_lon"] == pytest.approx(-75.165)
 
 
-# --- Stop times parsing ---
-
-class TestParseStopTimes:
-    def test_includes_bus_stop_times(self):
-        result = parse_zip(make_test_zip())
-        assert ("t1", 1) in result["stop_times"]
-
-    def test_includes_trolley_stop_times(self):
-        result = parse_zip(make_test_zip())
-        assert ("t2", 1) in result["stop_times"]
-
-    def test_excludes_rail_stop_times(self):
-        result = parse_zip(make_test_zip())
-        assert ("t3", 1) not in result["stop_times"]
-
-    def test_stop_time_fields(self):
-        result = parse_zip(make_test_zip())
-        st = result["stop_times"][("t1", 1)]
-        assert st["arrival_time"] == "10:00:00"
-        assert st["stop_id"] == "S1"
-
-
-# --- Calendar parsing ---
+# --- Calendar parsing (metadata) ---
 
 class TestParseCalendar:
-    def test_includes_all_calendars(self):
-        result = parse_zip(make_test_zip())
-        assert " weekday" in result["calendar"]
+    def test_includes_all_calendars(self, tmp_path):
+        assert " weekday" in _metadata(tmp_path)["calendar"]
 
-    def test_calendar_fields(self):
-        result = parse_zip(make_test_zip())
-        c = result["calendar"][" weekday"]
+    def test_calendar_fields(self, tmp_path):
+        c = _metadata(tmp_path)["calendar"][" weekday"]
         assert c["monday"] == 1
         assert c["start_date"] == "20260101"
 
 
-# --- Integration ---
+# --- StaticDB: trips + stop_times lookups ---
 
-class TestParseZipIntegration:
-    def test_full_parse(self):
-        data = parse_zip(make_test_zip())
-        assert set(data.keys()) == {"routes", "trips", "stops", "stop_times", "calendar"}
-        assert len(data["routes"]) == 2
-        assert len(data["trips"]) == 2
-        assert len(data["stops"]) == 3
-        assert len(data["stop_times"]) == 3
-        assert len(data["calendar"]) == 1
+class TestStaticDB:
+    def test_stop_time_lookup(self, static):
+        assert static.stop_time("t1", 1) == {"arrival_time": "10:00:00", "stop_id": "S1"}
 
-    def test_invalid_zip(self):
-        with pytest.raises(zipfile.BadZipFile):
-            parse_zip(b"not a zip")
+    def test_stop_time_unknown_returns_none(self, static):
+        assert static.stop_time("t1", 99) is None
 
-    def test_missing_inner_zip(self):
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("something.txt", "hello")
-        with pytest.raises(KeyError):
-            parse_zip(buf.getvalue())
+    def test_route_for_trip(self, static):
+        assert static.route_for_trip("t1") == "bus42"
+        assert static.route_for_trip("t2") == "trolley10"
 
-    def test_empty_stop_times(self):
-        result = parse_zip(make_test_zip(stop_times=[]))
-        assert result["stop_times"] == {}
+    def test_route_for_unknown_returns_none(self, static):
+        assert static.route_for_trip("nope") is None
 
-    def test_empty_trips(self):
-        result = parse_zip(make_test_zip(trips=[]))
-        assert result["trips"] == {}
-        assert result["stop_times"] == {}  # no trips → no stop_times
+    def test_rail_excluded(self, static):
+        assert static.route_for_trip("t3") is None
+        assert static.stop_time("t3", 1) is None
+
+    def test_iter_stop_times_scoped_and_ordered(self, static):
+        rows = list(static.iter_stop_times())
+        assert [r[0] for r in rows] == ["t1", "t1", "t2"]
+        assert [r[1] for r in rows] == [1, 2, 1]
+        # (trip_id, stop_sequence, arrival_time, stop_id)
+        assert rows[0] == ("t1", 1, "10:00:00", "S1")
+        assert rows[2] == ("t2", 1, "10:10:00", "S2")
+
+    def test_iter_trips_scoped(self, static):
+        trips = dict(static.iter_trips())
+        assert trips == {"t1": "bus42", "t2": "trolley10"}
+
+    def test_empty_stop_times(self, tmp_path):
+        data_dir = tmp_path / "gtfs-static"
+        data_dir.mkdir()
+        (data_dir / "latest.zip").write_bytes(make_test_zip(stop_times=[]))
+        db_path = tmp_path / "static.db"
+        import_to_sqlite(str(data_dir), str(db_path))
+        s = StaticDB(str(db_path))
+        try:
+            assert s.stop_time("t1", 1) is None
+            assert list(s.iter_stop_times()) == []
+            assert s.route_for_trip("t1") == "bus42"  # trips still imported
+        finally:
+            s.close()
+
+    def test_empty_trips(self, tmp_path):
+        data_dir = tmp_path / "gtfs-static"
+        data_dir.mkdir()
+        (data_dir / "latest.zip").write_bytes(make_test_zip(trips=[]))
+        db_path = tmp_path / "static.db"
+        import_to_sqlite(str(data_dir), str(db_path))
+        s = StaticDB(str(db_path))
+        try:
+            assert list(s.iter_trips()) == []
+            assert list(s.iter_stop_times()) == []  # no trips → no stop_times
+        finally:
+            s.close()
+
+    def test_reimport_is_idempotent(self, tmp_path):
+        data_dir = tmp_path / "gtfs-static"
+        data_dir.mkdir()
+        (data_dir / "latest.zip").write_bytes(make_test_zip())
+        db_path = tmp_path / "static.db"
+        import_to_sqlite(str(data_dir), str(db_path))
+        import_to_sqlite(str(data_dir), str(db_path))  # rebuild over existing
+        s = StaticDB(str(db_path))
+        try:
+            assert dict(s.iter_trips()) == {"t1": "bus42", "t2": "trolley10"}
+        finally:
+            s.close()
+
+    def test_missing_zip_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            import_to_sqlite(str(tmp_path / "nonexistent"), str(tmp_path / "s.db"))
+
+
+# --- Active route ids (for dropped-route registry windows) ---
+
+class TestActiveRouteIds:
+    def test_returns_scoped_trip_route_ids(self, tmp_path):
+        data_dir = tmp_path / "gtfs-static"
+        data_dir.mkdir()
+        (data_dir / "latest.zip").write_bytes(make_test_zip())
+        assert active_route_ids(str(data_dir)) == {"bus42", "trolley10"}
 
 
 # --- Local save/load ---
@@ -231,31 +256,27 @@ class TestLocalSaveLoad:
     def test_round_trip(self, tmp_path):
         zip_bytes = make_test_zip()
         data_dir = tmp_path / "gtfs-static"
-
-        # Save
         _save_zip(str(data_dir), zip_bytes, "Mon, 18 Aug 2026 14:30:00 GMT")
 
-        # Verify files exist
         assert (data_dir / "freshness.txt").read_text() == "Mon, 18 Aug 2026 14:30:00 GMT"
         assert (data_dir / "latest.zip").stat().st_size > 0
 
-        # Load
-        loaded = load_local(str(data_dir))
-        original = parse_zip(zip_bytes)
-        assert loaded["routes"].keys() == original["routes"].keys()
-        assert loaded["stop_times"].keys() == original["stop_times"].keys()
+        metadata = load_local_metadata(str(data_dir))
+        assert set(metadata.keys()) == {"routes", "stops", "calendar"}
+        assert len(metadata["routes"]) == 2
+        assert len(metadata["stops"]) == 3
+        assert len(metadata["calendar"]) == 1
 
     def test_load_missing_dir(self, tmp_path):
         with pytest.raises(FileNotFoundError):
-            load_local(str(tmp_path / "nonexistent"))
+            load_local_metadata(str(tmp_path / "nonexistent"))
 
     def test_load_missing_freshness(self, tmp_path):
         data_dir = tmp_path / "gtfs-static"
         data_dir.mkdir()
         (data_dir / "latest.zip").write_bytes(make_test_zip())
         # No freshness.txt → should still load the zip
-        loaded = load_local(str(data_dir))
-        assert len(loaded["routes"]) == 2
+        assert len(load_local_metadata(str(data_dir))["routes"]) == 2
 
 
 # --- Freshness ---

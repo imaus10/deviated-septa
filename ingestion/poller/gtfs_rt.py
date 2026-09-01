@@ -64,12 +64,12 @@ def parse_trip_updates(raw: bytes) -> gtfs_realtime_pb2.FeedMessage:
     return feed
 
 
-def extract_observations(feed, stop_times_data: dict) -> list[dict]:
+def extract_observations(feed, static) -> list[dict]:
     """Extract observations from GTFS-RT feed.
 
     Args:
-        stop_times_data: {(trip_id, stop_seq): {"arrival_time": str, "stop_id": str}}
-            as returned by gtfs_static.parse_zip()
+        static: gtfs_static.StaticDB — point lookups via static.stop_time(trip_id,
+            stop_seq) returning {"arrival_time": str, "stop_id": str} or None.
     """
     observations = []
 
@@ -92,7 +92,7 @@ def extract_observations(feed, stop_times_data: dict) -> list[dict]:
             stop_seq = stu.stop_sequence
             predicted_ts = stu.arrival.time
 
-            scheduled_row = stop_times_data.get((trip_id, stop_seq))
+            scheduled_row = static.stop_time(trip_id, stop_seq)
             if scheduled_row is None:
                 continue
 
@@ -110,6 +110,7 @@ def extract_observations(feed, stop_times_data: dict) -> list[dict]:
                 {
                     "trip_id": trip_id,
                     "stop_sequence": stop_seq,
+                    "stop_id": scheduled_row["stop_id"],
                     "predicted_time": datetime.fromtimestamp(
                         int(predicted_ts), tz=timezone.utc
                     ),

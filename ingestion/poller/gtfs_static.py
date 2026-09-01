@@ -1,19 +1,23 @@
 """GTFS static feed parser — downloads, parses, and stores SEPTA GTFS data.
 
-Parses the GTFS zip into in-memory dicts keyed by primary key(s).
-The raw zip is stored locally for restart recovery and S3 archival.
+The heavy feed tables (stop_times ~2.1M rows, trips) are streamed into a local
+SQLite DB (`StaticDB`) once per feed change — never materialized as Python
+dicts, which would spike RSS to ~1.4 GB and OOM the 1 GB Pi on every poll.
+Routes/stops/calendar metadata is tiny and stays in-memory where used.
 
 Usage:
     from poller.gtfs_static import check_and_update
-    data, changed = check_and_update("data/")
-    # data = {"routes": {...}, "trips": {...}, "stops": {...},
-    #         "stop_times": {...}, "calendar": {...}}
+    static, changed = check_and_update("data/", "state/static.db")
+    arrival = static.stop_time(trip_id, stop_seq)     # {"arrival_time","stop_id"}
+    route_id = static.route_for_trip(trip_id)
+    metadata = load_local_metadata("data/")           # {"routes","stops","calendar"}
 """
 
 import csv
 import io
 import os
 import pathlib
+import sqlite3
 import zipfile
 
 import httpx
@@ -21,9 +25,6 @@ import httpx
 from poller.constants import ROUTE_SCOPE_TYPES
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
-
-# Bus + trolley scope — matches the aggregation filter.
-# Type 0 = trolley (subway-surface), 3 = bus, 11 = trolleybus (59/66/75).
 
 
 # ---------------------------------------------------------------------------
@@ -76,20 +77,6 @@ def _parse_routes(rows: list[dict]) -> dict[str, dict]:
     return routes
 
 
-def _parse_trips(rows: list[dict], route_ids: set[str]) -> dict[str, dict]:
-    trips = {}
-    for r in rows:
-        if r["route_id"] not in route_ids:
-            continue
-        trips[r["trip_id"]] = {
-            "route_id": r["route_id"],
-            "service_id": r["service_id"],
-            "direction_id": int(r.get("direction_id", 0)),
-            "trip_headsign": r.get("trip_headsign"),
-        }
-    return trips
-
-
 def _parse_stops(rows: list[dict]) -> dict[str, dict]:
     stops = {}
     for r in rows:
@@ -99,18 +86,6 @@ def _parse_stops(rows: list[dict]) -> dict[str, dict]:
             "stop_lon": float(r["stop_lon"]) if r.get("stop_lon") else None,
         }
     return stops
-
-
-def _parse_stop_times(rows) -> dict[tuple[str, int], dict]:
-    """Parse stop_times from a pre-filtered row stream."""
-    stop_times = {}
-    for r in rows:
-        key = (r["trip_id"], int(r["stop_sequence"]))
-        stop_times[key] = {
-            "arrival_time": r.get("arrival_time"),
-            "stop_id": r["stop_id"],
-        }
-    return stop_times
 
 
 def _parse_calendar(rows: list[dict]) -> dict[str, dict]:
@@ -131,54 +106,147 @@ def _parse_calendar(rows: list[dict]) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Main parser — orchestrates the per-file parsers
+# Static SQLite store — stop_times + trips (the memory-heavy tables)
 # ---------------------------------------------------------------------------
 
-def parse_zip(gtfs_zip: bytes) -> dict:
-    """Parse SEPTA GTFS zip into in-memory dicts.
+STATIC_SCHEMA = """
+CREATE TABLE IF NOT EXISTS stop_times (
+    trip_id        text NOT NULL,
+    stop_sequence  integer NOT NULL,
+    arrival_time   text,
+    stop_id        text NOT NULL,
+    PRIMARY KEY (trip_id, stop_sequence)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS trips (
+    trip_id  text PRIMARY KEY,
+    route_id text NOT NULL
+) WITHOUT ROWID;
+"""
 
-    Returns dict with keys: routes, trips, stops, stop_times, calendar.
-    Only bus/trolley routes are included (route_type IN 0, 3, 11).
-    Trips and stop_times are filtered to those routes.
-    Stops are NOT filtered (a stop may serve both bus and rail).
+
+class StaticDB:
+    """SQLite-backed GTFS static lookups (stop_times + trips).
+
+    Point lookups feed extract_observations during each poll; iteration feeds
+    route-geometry generation on refresh. The heavy rows live on disk, never
+    materialized as Python dicts.
     """
-    with zipfile.ZipFile(io.BytesIO(gtfs_zip)) as outer:
-        inner_raw = outer.read("google_bus.zip")
-        with zipfile.ZipFile(io.BytesIO(inner_raw)) as z:
-            files = {name: z.read(name).decode("utf-8-sig") for name in z.namelist()}
 
-    # 1. Routes — filtered to bus/trolley
-    routes = _parse_routes(_parse_csv(files.get("routes.txt", "")))
-    route_ids = set(routes.keys())
+    def __init__(self, db_path):
+        self.db_path = str(db_path)
+        pathlib.Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.executescript(STATIC_SCHEMA)
+        self.conn.commit()
 
-    # 2. Trips — filtered to bus/trolley routes
-    trips = _parse_trips(_parse_csv(files.get("trips.txt", "")), route_ids)
-    trip_ids = set(trips.keys())
+    def close(self):
+        self.conn.close()
 
-    # 3. Stops — all stops (unfiltered)
-    stops = _parse_stops(_parse_csv(files.get("stops.txt", "")))
+    def stop_time(self, trip_id: str, stop_sequence: int):
+        """Schedule row for (trip_id, stop_sequence) or None.
 
-    # 4. Stop times — filtered to bus/trolley trips (streaming, low memory)
-    stop_times_rows = _parse_csv(
-        files.get("stop_times.txt", ""),
-        filter_fn=lambda r: r["trip_id"] in trip_ids,
-    )
-    stop_times = _parse_stop_times(stop_times_rows)
+        Returns {"arrival_time": str, "stop_id": str}, the shape extract
+        observations expects.
+        """
+        row = self.conn.execute(
+            "SELECT arrival_time, stop_id FROM stop_times "
+            "WHERE trip_id = ? AND stop_sequence = ?",
+            (trip_id, stop_sequence),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"arrival_time": row[0], "stop_id": row[1]}
 
-    # 5. Calendar — all
-    calendar = _parse_calendar(_parse_csv(files.get("calendar.txt", "")))
+    def route_for_trip(self, trip_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT route_id FROM trips WHERE trip_id = ?", (trip_id,)
+        ).fetchone()
+        return row[0] if row else None
 
-    return {
-        "routes": routes,
-        "trips": trips,
-        "stops": stops,
-        "stop_times": stop_times,
-        "calendar": calendar,
-    }
+    def iter_stop_times(self):
+        """Yield (trip_id, stop_sequence, arrival_time, stop_id)."""
+        return self.conn.execute(
+            "SELECT trip_id, stop_sequence, arrival_time, stop_id FROM stop_times "
+            "ORDER BY trip_id, stop_sequence"
+        )
+
+    def iter_trips(self):
+        """Yield (trip_id, route_id)."""
+        return self.conn.execute("SELECT trip_id, route_id FROM trips")
+
+
+def _open_inner_zip(data_dir: str):
+    """Open google_bus.zip from the local latest.zip (context manager)."""
+    d = pathlib.Path(data_dir)
+    zip_path = d / "latest.zip"
+    if not zip_path.exists():
+        raise FileNotFoundError(f"No GTFS zip found at {zip_path}")
+    outer = zipfile.ZipFile(io.BytesIO(zip_path.read_bytes()))
+    inner_raw = outer.read("google_bus.zip")
+    outer.close()
+    return zipfile.ZipFile(io.BytesIO(inner_raw))
+
+
+def import_to_sqlite(data_dir: str, db_path: str) -> None:
+    """(Re)build the static DB by streaming stop_times + trips from the zip.
+
+    Scoped to bus/trolley routes (route_type IN 0, 3, 11) exactly like the old
+    parse_zip. Decodes zip entries incrementally and pipes rows straight into
+    executemany — peak RSS stays in the tens of MB instead of the ~1.4 GB the
+    in-memory dict representation required.
+    """
+    pathlib.Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("DROP TABLE IF EXISTS stop_times")
+        conn.execute("DROP TABLE IF EXISTS trips")
+        conn.executescript(STATIC_SCHEMA)
+
+        with _open_inner_zip(data_dir) as z:
+            route_ids = set(
+                _parse_routes(_parse_csv(z.read("routes.txt").decode("utf-8-sig")))
+            )
+
+            with z.open("trips.txt") as f:
+                rd = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
+                conn.executemany(
+                    "INSERT OR REPLACE INTO trips (trip_id, route_id) VALUES (?, ?)",
+                    (
+                        (r["trip_id"], r["route_id"])
+                        for r in rd
+                        if r["route_id"] in route_ids
+                    ),
+                )
+            conn.commit()
+            trip_ids = {row[0] for row in conn.execute("SELECT trip_id FROM trips")}
+
+            with z.open("stop_times.txt") as f:
+                rd = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
+                conn.executemany(
+                    "INSERT INTO stop_times "
+                    "(trip_id, stop_sequence, arrival_time, stop_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        (
+                            r["trip_id"],
+                            int(r["stop_sequence"]),
+                            r.get("arrival_time"),
+                            r["stop_id"],
+                        )
+                        for r in rd
+                        if r["trip_id"] in trip_ids
+                    ),
+                )
+            conn.commit()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Local storage — save/load raw zip + freshness
+# Local storage — save/load raw zip + freshness + tiny metadata
 # ---------------------------------------------------------------------------
 
 def _save_zip(data_dir: str, zip_bytes: bytes, last_modified: str) -> None:
@@ -189,13 +257,32 @@ def _save_zip(data_dir: str, zip_bytes: bytes, last_modified: str) -> None:
     (d / "freshness.txt").write_text(last_modified)
 
 
-def load_local(data_dir: str) -> dict:
-    """Load and parse GTFS data from the local zip on disk."""
-    d = pathlib.Path(data_dir)
-    zip_path = d / "latest.zip"
-    if not zip_path.exists():
-        raise FileNotFoundError(f"No GTFS zip found at {zip_path}")
-    return parse_zip(zip_path.read_bytes())
+def load_local_metadata(data_dir: str) -> dict:
+    """Load routes + stops + calendar metadata from the local zip.
+
+    All three are tiny (routes/stops/calendar only — never trips/stop_times),
+    so peak memory stays at ~85 MB. Used by build_current (routes/stops
+    metadata) and the parquet registries (routes/stops/calendar for validity
+    windows). The heavy feed tables come from StaticDB instead.
+    """
+    with _open_inner_zip(data_dir) as z:
+        routes = _parse_routes(_parse_csv(z.read("routes.txt").decode("utf-8-sig")))
+        stops = _parse_stops(_parse_csv(z.read("stops.txt").decode("utf-8-sig")))
+        calendar = _parse_calendar(_parse_csv(z.read("calendar.txt").decode("utf-8-sig")))
+    return {"routes": routes, "stops": stops, "calendar": calendar}
+
+
+def active_route_ids(data_dir: str) -> set[str]:
+    """Route ids present in scoped trips (route_type IN 0, 3, 11) of the local feed.
+
+    SEPTA drops routes by removing their trips while leaving the name row in
+    routes.txt, so presence-in-trips is the true "active" test — used to seed
+    observation-derived validity windows for dropped routes in the registries.
+    """
+    with _open_inner_zip(data_dir) as z:
+        routes = _parse_routes(_parse_csv(z.read("routes.txt").decode("utf-8-sig")))
+        rd = csv.DictReader(io.TextIOWrapper(z.open("trips.txt"), encoding="utf-8-sig"))
+        return {r["route_id"] for r in rd if r["route_id"] in routes}
 
 
 def get_stored_freshness(data_dir: str) -> str | None:
@@ -205,22 +292,29 @@ def get_stored_freshness(data_dir: str) -> str | None:
         return None
     return freshness_path.read_text().strip()
 
-def check_and_update(data_dir: str) -> tuple[dict, bool]:
-    """Check if the GTFS feed has updated, download if so, return parsed data.
 
-    Returns (data, changed) where:
-      - data is the parsed GTFS dicts
-      - changed is True if a new feed was downloaded
+def check_and_update(data_dir: str, db_path: str) -> tuple[StaticDB, bool]:
+    """Ensure the static feed is current and its SQLite store is built.
+
+    Returns (static, changed): a StaticDB backed by db_path, plus whether a new
+    feed was downloaded and imported this call. The un-changed path only opens
+    the existing store (no re-import, no feed materialization) — it is the
+    every-minute hot path.
     """
     remote_freshness = fetch_freshness()
     stored_freshness = get_stored_freshness(data_dir)
 
-    if remote_freshness == stored_freshness and (pathlib.Path(data_dir) / "latest.zip").exists():
-        data = load_local(data_dir)
-        return data, False
+    unchanged = (
+        remote_freshness == stored_freshness
+        and (pathlib.Path(data_dir) / "latest.zip").exists()
+    )
+    if unchanged:
+        if not pathlib.Path(db_path).exists():
+            import_to_sqlite(data_dir, db_path)
+        return StaticDB(db_path), False
 
     print("  downloading GTFS static data...", flush=True)
     zip_bytes = download_zip()
     _save_zip(data_dir, zip_bytes, remote_freshness)
-    data = parse_zip(zip_bytes)
-    return data, True
+    import_to_sqlite(data_dir, db_path)
+    return StaticDB(db_path), True

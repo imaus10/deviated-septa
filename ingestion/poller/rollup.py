@@ -219,7 +219,8 @@ def build_current(obs_db, static: dict, state_dir, now=None, since_seconds: int 
 
     Args:
         obs_db: ObservationsDB instance
-        static: gtfs_static.parse_zip() dict (routes/stops used as shared metadata)
+        static: metadata dict from gtfs_static.load_local_metadata()
+            (routes/stops used as shared metadata)
         state_dir: local state dir (daily archives + baseline live here)
         now: tz-aware datetime (Eastern); default now
         since_seconds: how far back 'hour' reaches (default 3600)
