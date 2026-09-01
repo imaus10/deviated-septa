@@ -13,9 +13,16 @@ import poller.s3 as s3
 class FakeClient:
     def __init__(self):
         self.calls = []
+        self.existing = set()
 
     def upload_file(self, path, bucket, key, ExtraArgs=None):
         self.calls.append((path, bucket, key, ExtraArgs))
+
+    def head_object(self, Bucket=None, Key=None):
+        self.calls.append(("head", Bucket, Key))
+        if Key not in self.existing:
+            raise Exception("404")
+        return {}
 
 
 def _mock_client(monkeypatch, fake: FakeClient):
@@ -51,6 +58,23 @@ class TestUploadFile:
             "CacheControl": "max-age=55, stale-while-revalidate=5",
             "ContentType": "application/json",
         }
+
+
+class TestObjectExists:
+    def test_true_when_present(self, monkeypatch):
+        _set_env(monkeypatch, S3_BUCKET="b", S3_ACCESS_KEY_ID="AK", S3_SECRET_ACCESS_KEY="SK")
+        fake = FakeClient()
+        fake.existing = {"archive/observations/2026-08-28.parquet"}
+        _mock_client(monkeypatch, fake)
+
+        assert s3.object_exists("archive/observations/2026-08-28.parquet") is True
+
+    def test_false_when_absent_or_error(self, monkeypatch):
+        _set_env(monkeypatch, S3_BUCKET="b", S3_ACCESS_KEY_ID="AK", S3_SECRET_ACCESS_KEY="SK")
+        fake = FakeClient()
+        _mock_client(monkeypatch, fake)
+
+        assert s3.object_exists("archive/observations/2026-08-28.parquet") is False
 
 
 class TestMakeClient:

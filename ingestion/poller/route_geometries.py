@@ -4,21 +4,15 @@ Builds one full-coverage polyline per bus/trolley route (every stop the route
 serves lies on its line) using a "spider" walk over the stop graph derived from
 the GTFS static tables.
 
-Rebuild route_geometries from ingestion/:
-    source ../.env && uv run python -m poller.route_geometries
-
-Idempotent — safe to re-run any time.
+This module operates on the local static feed dict (post-Neon) — no database.
+The poller calls `build_geometries(data)` on static refresh to emit
+`public/geometries.json`.
 """
 
 import math
 from collections import defaultdict
-from datetime import datetime, timezone
 
-from psycopg2.extras import Json
-
-from poller.db import get_connection, upsert_table
-
-# Bus + trolley scope, matching 007's agg-function filter. Type 11 (trolleybus)
+# Bus + trolley scope, matching the aggregation filter. Type 11 (trolleybus)
 # covers SEPTA routes 59/66/75, which carry real real-time data.
 ROUTE_SCOPE_TYPES = (0, 3, 11)
 
@@ -81,41 +75,32 @@ def _component_chain(comp, graph, start):
     return chain
 
 
-def _load_route_geometry_inputs(db):
-    """Return per-route trip stop-sequences + stop graph from the static tables."""
-    with db.cursor() as cur:
-        cur.execute(
-            """
-            SELECT route_id, route_short_name
-            FROM routes
-            WHERE route_type IN %(types)s
-            """,
-            {"types": ROUTE_SCOPE_TYPES},
-        )
-        route_names = dict(cur.fetchall())
+def _load_route_geometry_inputs(data):
+    """Return per-route trip stop-sequences + stop graph from a static feed dict."""
+    route_names = {rid: v.get("route_name", "") for rid, v in data["routes"].items()}
 
-        cur.execute(
-            "SELECT stop_id, stop_lat, stop_lon FROM stops "
-            "WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL"
-        )
-        stop_coords = {row[0]: (float(row[1]), float(row[2])) for row in cur.fetchall()}
+    stop_coords = {
+        sid: (v["stop_lat"], v["stop_lon"])
+        for sid, v in data["stops"].items()
+        if v.get("stop_lat") is not None and v.get("stop_lon") is not None
+    }
 
-        cur.execute(
-            """
-            SELECT t.route_id, t.trip_id, st.stop_sequence, st.stop_id
-            FROM stop_times st
-            JOIN trips t ON t.trip_id = st.trip_id
-            JOIN routes r ON r.route_id = t.route_id
-            WHERE r.route_type IN %(types)s
-            ORDER BY t.trip_id, st.stop_sequence
-            """,
-            {"types": ROUTE_SCOPE_TYPES},
-        )
-        trips_by_route = defaultdict(dict)
-        for route_id, trip_id, _seq, stop_id in cur:
-            if stop_id not in stop_coords:
-                continue
-            trips_by_route[route_id].setdefault(trip_id, []).append(stop_id)
+    by_trip = defaultdict(list)
+    for (trip_id, stop_seq), st in data["stop_times"].items():
+        by_trip[trip_id].append((stop_seq, st["stop_id"]))
+    for trip_id, entries in by_trip.items():
+        entries.sort(key=lambda e: e[0])
+
+    trips_by_route = defaultdict(dict)
+    for trip_id, trip in data["trips"].items():
+        route_id = trip["route_id"]
+        seq = [
+            stop_id
+            for _seq, stop_id in by_trip.get(trip_id, ())
+            if stop_id in stop_coords
+        ]
+        if seq:
+            trips_by_route[route_id].setdefault(trip_id, []).extend(seq)
 
     route_graphs = {}
     for route_id, trips in trips_by_route.items():
@@ -205,11 +190,15 @@ def _spider_order(graph, trips, stop_coords):
     return order
 
 
-def regenerate_route_geometries(db):
-    route_names, stop_coords, trips_by_route, route_graphs = _load_route_geometry_inputs(db)
+def build_geometries(data) -> list[dict]:
+    """One polyline per bus/trolley route, sorted by route_id.
 
-    now_utc = datetime.now(timezone.utc)
-    rows = []
+    Returns [{route_id, route_name, coordinates}] where coordinates is a
+    [lat, lon] pair list, dropping routes with fewer than 2 stops (no line).
+    """
+    route_names, stop_coords, trips_by_route, route_graphs = _load_route_geometry_inputs(data)
+
+    out = []
     for route_id in sorted(route_names):
         trips = list(trips_by_route.get(route_id, {}).values())
         if not trips:
@@ -222,44 +211,11 @@ def regenerate_route_geometries(db):
         ]
         if len(coords) < 2:
             continue
-        rows.append(
+        out.append(
             {
                 "route_id": route_id,
-                "route_short_name": route_names[route_id],
-                "coordinates": Json(coords),
-                "updated_at": now_utc,
+                "route_name": route_names[route_id],
+                "coordinates": coords,
             }
         )
-
-    if rows:
-        upsert_table(db, "route_geometries", rows, pk_cols=["route_id"])
-
-    with db.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM route_geometries
-            WHERE coordinates IS NULL
-               OR jsonb_array_length(coordinates) < 2
-               OR route_id NOT IN (
-                   SELECT route_id FROM routes WHERE route_type IN %(types)s
-               )
-            """,
-            {"types": ROUTE_SCOPE_TYPES},
-        )
-    db.commit()
-
-
-def main():
-    conn = get_connection()
-    try:
-        regenerate_route_geometries(conn)
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*), count(coordinates) FROM route_geometries")
-            total, with_coords = cur.fetchone()
-    finally:
-        conn.close()
-    print(f"route_geometries: {total} routes, {with_coords} with coordinates")
-
-
-if __name__ == "__main__":
-    main()
+    return out

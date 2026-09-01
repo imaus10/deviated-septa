@@ -41,3 +41,18 @@ def upload_file(
     if content_type:
         extra["ContentType"] = content_type
     client.upload_file(str(local_path), bucket, key, ExtraArgs=extra or None)
+
+
+def object_exists(key: str, *, bucket: str | None = None, client=None) -> bool:
+    """True if s3://bucket/key exists. False on any error (incl. 404).
+
+    Errors are treated as "does not exist" so callers skip/re-upload without
+    blocking on a transient S3 hiccup.
+    """
+    bucket = bucket or os.environ["S3_BUCKET"]
+    client = client or _make_client()
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False

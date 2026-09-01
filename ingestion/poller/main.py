@@ -27,8 +27,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import poller.archives as archives
 import poller.gtfs_rt as gtfs_rt
 import poller.gtfs_static as gtfs_static
+import poller.route_geometries as route_geometries
 import poller.s3 as s3
 from poller.constants import EASTERN
 from poller.rollup import (
@@ -38,7 +40,7 @@ from poller.rollup import (
     save_baseline,
     write_json,
 )
-from poller.state import ObservationsDB, save_state
+from poller.state import ObservationsDB, load_state, save_state
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -47,6 +49,7 @@ STATE_DIR = ROOT / "state"
 load_dotenv(ROOT.parent / ".env")
 
 CURRENT_CACHE_CONTROL = "max-age=55, stale-while-revalidate=5"
+PARQUET_CONTENT_TYPE = "application/vnd.apache.parquet"
 
 
 def _log_time(label, elapsed):
@@ -57,16 +60,73 @@ def _eastern_today() -> str:
     return datetime.now(EASTERN).date().isoformat()
 
 
-def _upload(key: str, path, **meta) -> None:
-    """Best-effort upload with a single retry; local file always stays truth."""
-    try:
-        s3.upload_file(path, key, **meta)
-    except Exception as e:
+def _upload(key: str, path, **meta) -> bool:
+    """Best-effort upload with a single retry; local file always stays truth.
+
+    Returns True on success, False if the upload failed (after one retry).
+    """
+    for attempt in range(2):
         try:
             s3.upload_file(path, key, **meta)
-            return
-        except Exception:
-            print(f"  [s3] upload failed for {key}: {e}", flush=True)
+            return True
+        except Exception as e:
+            last_err = e
+    print(f"  [s3] upload failed for {key}: {last_err}", flush=True)
+    return False
+
+
+def _archive_elapsed_dates(db, current_sd) -> None:
+    """Archive every store service date strictly before current_sd.
+
+    Fires once a new service day starts: dates fully elapsed (older than the
+    current service date) are written to archive/observations/<sd>.parquet,
+    uploaded, then deleted locally (S3 is the sole copy / eternal ledger).
+
+    A date already present at archive/observations/<sd>.parquet on S3 is
+    skipped to avoid re-uploading a finalized archive. On a successful upload
+    the local parquet is removed; on a failure it is kept so the next cycle
+    retries.
+    """
+    obs_dir = STATE_DIR / "archive" / "observations"
+    for sd, _ in db.service_date_stats():
+        if sd >= current_sd:
+            continue
+        key = f"archive/observations/{sd}.parquet"
+        if s3.object_exists(key):
+            continue
+        rows = db.export_day(sd)
+        if not rows:
+            continue
+        path = archives.write_observations(rows, str(obs_dir))
+        if _upload(key, path):
+            path.unlink()
+            print(f"  [archive] {key} uploaded + deleted", flush=True)
+
+
+def _refresh_static_derived(data) -> None:
+    """Regenerate static-derived artifacts after a fresh static feed import.
+
+    Emits public/geometries.json plus the route/stop registries, and uploads
+    all three to S3. Runs only on static refresh (route geometry and registries
+    never change mid-feed).
+    """
+    geometries = route_geometries.build_geometries(data)
+    geo_path = STATE_DIR / "geometries.json"
+    write_json(geometries, geo_path)
+    _upload("public/geometries.json", geo_path, cache_control=CURRENT_CACHE_CONTROL)
+    print(f"  [geometries] {len(geometries)} routes -> uploaded", flush=True)
+
+    routes, stops = archives.build_registries(data)
+    archive_dir = STATE_DIR / "archive"
+    routes_path = archives.write_routes_registry(routes, str(archive_dir))
+    _upload("archive/routes.parquet", routes_path, content_type=PARQUET_CONTENT_TYPE)
+    stops_path = archives.write_stops_registry(stops, str(archive_dir))
+    _upload("archive/stops.parquet", stops_path, content_type=PARQUET_CONTENT_TYPE)
+    print(
+        f"  [registries] {len(routes)} routes, {len(stops)} stops -> uploaded",
+        flush=True,
+    )
+
 
 
 def main():
@@ -79,6 +139,7 @@ def main():
     _log_time("static", time.perf_counter() - t1)
     if changed:
         print("  static feed refreshed", flush=True)
+        _refresh_static_derived(data)
 
     # 2. Fetch + parse the RT feed
     t2 = time.perf_counter()
@@ -154,6 +215,8 @@ def main():
             else (store_dates[-1] if store_dates else _eastern_today())
         )
         print(f"  service date: {current_sd}", flush=True)
+
+        _archive_elapsed_dates(db, current_sd)
 
         baseline, pruned = prune_window(db, str(STATE_DIR), current_sd)
         if pruned:
