@@ -6,8 +6,6 @@ on:
       - main
     paths:
       - "frontend/**"
-      - "ingestion/migrations/**"
-      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 permissions:
@@ -20,48 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      migrations: ${{ steps.filter.outputs.migrations }}
-      frontend: ${{ steps.filter.outputs.frontend }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            migrations:
-              - 'ingestion/migrations/**'
-            frontend:
-              - 'frontend/**'
-
-  migrate:
-    needs: changes
-    if: needs.changes.outputs.migrations == 'true'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ingestion
-    env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL_UNPOOLED }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: astral-sh/setup-uv@v5
-        with:
-          version: "latest"
-          python-version: "3.12"
-
-      - run: uv sync --frozen --extra dev
-
-      - name: Apply migrations
-        run: uv run alembic upgrade head
-
   deploy-frontend:
-    needs: [changes, migrate]
-    if: always() && needs.changes.outputs.frontend == 'true' && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -83,7 +40,7 @@ jobs:
       - name: Build
         run: npm run build
         env:
-          VITE_NEON_URL: ${{ secrets.VITE_NEON_URL }}
+          VITE_PUBLIC_URL: ${{ secrets.VITE_PUBLIC_URL }}
 
       - name: Disable Jekyll processing
         run: touch dist/.nojekyll

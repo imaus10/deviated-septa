@@ -1,8 +1,9 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
-import { sql } from "../lib/neon.js";
+import { buildSnapshot } from "../lib/current.js";
 
 const POLL_INTERVAL = 60_000;
 const DEFAULT_PERIOD = "hourly";
+const BASE_URL = import.meta.env.VITE_PUBLIC_URL;
 
 export function useDashboardData() {
   const snapshot = ref([]);
@@ -18,36 +19,25 @@ export function useDashboardData() {
 
   let timer = null;
 
+  async function fetchJson(path) {
+    const resp = await fetch(`${BASE_URL}${path}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${path}`);
+    return resp.json();
+  }
+
   async function fetchSnapshot() {
     try {
-      const [snapRows, geoRows] = await Promise.all([
-        sql`
-          SELECT *
-          FROM latest_snapshot
-          ORDER BY entity_type, entity_id
-        `,
-        sql`
-          SELECT *
-          FROM route_geometries
-          ORDER BY route_id
-        `,
+      const [current, geometries] = await Promise.all([
+        fetchJson("/current.json"),
+        fetchJson("/geometries.json"),
       ]);
-      snapshot.value = snapRows;
-      routeGeometries.value = geoRows;
+      snapshot.value = buildSnapshot(current);
+      routeGeometries.value = geometries;
+      dataRange.value = current.data_range || null;
       loading.value = false;
       error.value = null;
     } catch (e) {
       error.value = e.message;
-    }
-
-    try {
-      const [range] = await sql`
-        SELECT min(date) AS min, max(date) AS max
-        FROM daily_route_metrics
-      `;
-      dataRange.value = range && range.min ? range : null;
-    } catch {
-      dataRange.value = null;
     }
   }
 

@@ -29,8 +29,10 @@ resource "aws_s3_bucket_public_access_block" "this" {
   bucket                  = aws_s3_bucket.this.id
   block_public_acls       = true
   ignore_public_acls      = true
-  block_public_policy     = true
-  restrict_public_buckets = true
+  # Relaxed only in direct-S3 mode (use_cloudfront=false) so the public/*
+  # bucket policy below is allowed; fully blocked once CloudFront serves it.
+  block_public_policy     = var.use_cloudfront
+  restrict_public_buckets = var.use_cloudfront
 }
 
 resource "aws_s3_bucket_ownership_controls" "this" {
@@ -42,6 +44,7 @@ resource "aws_s3_bucket_ownership_controls" "this" {
 
 # ---- CloudFront OAC + distribution (public/ prefix only; archives stay private) ----
 resource "aws_cloudfront_origin_access_control" "this" {
+  count                             = var.use_cloudfront ? 1 : 0
   name                              = "deviated-septa-${var.environment}-oac"
   description                       = "OAC for deviated-septa ${var.environment} bucket"
   origin_access_control_origin_type = "s3"
@@ -50,6 +53,7 @@ resource "aws_cloudfront_origin_access_control" "this" {
 }
 
 resource "aws_cloudfront_distribution" "this" {
+  count           = var.use_cloudfront ? 1 : 0
   comment         = "Deviated SEPTA ${var.environment} static hosting"
   enabled         = true
   is_ipv6_enabled = true
@@ -60,7 +64,7 @@ resource "aws_cloudfront_distribution" "this" {
     domain_name              = aws_s3_bucket.this.bucket_regional_domain_name
     origin_id                = "s3-${local.bucket_id}"
     origin_path              = "/public"
-    origin_access_control_id = aws_cloudfront_origin_access_control.this.id
+    origin_access_control_id = aws_cloudfront_origin_access_control.this[0].id
   }
 
   default_cache_behavior {
@@ -89,6 +93,7 @@ resource "aws_cloudfront_distribution" "this" {
 
 # ---- Bucket policy: OAC may only GET the public/ prefix ----
 resource "aws_s3_bucket_policy" "cloudfront_public_only" {
+  count  = var.use_cloudfront ? 1 : 0
   bucket = aws_s3_bucket.this.id
 
   policy = jsonencode({
@@ -101,12 +106,44 @@ resource "aws_s3_bucket_policy" "cloudfront_public_only" {
         Resource  = "${aws_s3_bucket.this.arn}/public/*"
         Condition = {
           StringEquals = {
-            "AWS:SourceArn" = aws_cloudfront_distribution.this.arn
+            "AWS:SourceArn" = aws_cloudfront_distribution.this[0].arn
           }
         }
       }
     ]
   })
+}
+
+# ---- Direct-from-S3 mode (use_cloudfront=false): world-readable public/ prefix ----
+resource "aws_s3_bucket_policy" "public_only" {
+  count  = var.use_cloudfront ? 0 : 1
+  bucket = aws_s3_bucket.this.id
+  # S3 rejects a public policy while BlockPublicPolicy is true — relax it first.
+  depends_on = [aws_s3_bucket_public_access_block.this]
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.this.arn}/public/*"
+      }
+    ]
+  })
+}
+
+resource "aws_s3_bucket_cors_configuration" "this" {
+  count  = var.use_cloudfront ? 0 : 1
+  bucket = aws_s3_bucket.this.id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = ["*"]
+    max_age_seconds = 300
+  }
 }
 
 # ---- Poller IAM user, scoped to its own bucket only ----

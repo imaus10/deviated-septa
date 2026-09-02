@@ -8,6 +8,12 @@ variable "environment" {
   }
 }
 
+variable "use_cloudfront" {
+  description = "Serve public/ through CloudFront (true) or directly from S3 (false). "
+  type        = bool
+  default     = false
+}
+
 variable "region" {
   description = "AWS region"
   type        = string

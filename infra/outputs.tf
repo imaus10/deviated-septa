@@ -1,10 +1,10 @@
 output "cloudfront_domain_name" {
   description = "Public URL origin (e.g. https://d123.cloudfront.net)"
-  value       = aws_cloudfront_distribution.this.domain_name
+  value       = try(aws_cloudfront_distribution.this[0].domain_name, "")
 }
 
 output "distribution_id" {
-  value = aws_cloudfront_distribution.this.id
+  value = try(aws_cloudfront_distribution.this[0].id, "")
 }
 
 output "bucket_name" {
