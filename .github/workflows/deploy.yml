@@ -39,8 +39,6 @@ jobs:
 
       - name: Build
         run: npm run build
-        env:
-          VITE_PUBLIC_URL: ${{ secrets.VITE_PUBLIC_URL }}
 
       - name: Disable Jekyll processing
         run: touch dist/.nojekyll

@@ -5,6 +5,7 @@ __pycache__/
 .DS_Store
 .env
 .env.prod
+.env.dev
 ingestion/data/
 ingestion/state/
 infra/.terraform/

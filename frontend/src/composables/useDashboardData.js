@@ -3,7 +3,8 @@ import { buildSnapshot } from "../lib/current.js";
 
 const POLL_INTERVAL = 60_000;
 const DEFAULT_PERIOD = "hourly";
-const BASE_URL = import.meta.env.VITE_PUBLIC_URL;
+const BASE_URL =
+  import.meta.env.VITE_PUBLIC_URL || "https://deviated-septa-prod.s3.amazonaws.com/public";
 
 export function useDashboardData() {
   const snapshot = ref([]);
