@@ -15,7 +15,7 @@ import pathlib
 import sqlite3
 from datetime import datetime
 
-from poller.constants import CATEGORY_COUNT_KEYS
+from poller.constants import EARLY_TOLERANCE_SECONDS, LATE_TOLERANCE_SECONDS
 
 DEFAULT_STATE = {"service_date": None, "last_poll_ts": None}
 
@@ -33,10 +33,20 @@ CREATE TABLE IF NOT EXISTS observations (
     poll_timestamp integer,
     PRIMARY KEY (trip_id, stop_sequence, service_date)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_observations_routes ON observations (route_id, category);
-CREATE INDEX IF NOT EXISTS idx_observations_stops ON observations (stop_id, category);
-CREATE INDEX IF NOT EXISTS idx_observations_service_date ON observations (service_date);
+-- Covering composites for the rollup GROUP BYs: rows are ordered by
+-- service_date then entity, so SQLite groups incrementally (no temp b-tree),
+-- and delay_seconds is included so COUNT/SUM run index-only. The hour rollup
+-- keeps a plain poll_timestamp index (its result is small). The old
+-- single-purpose indexes forced a temp b-tree over the whole window — drop
+-- them here so existing stores self-migrate on the next open (no-ops after).
+DROP INDEX IF EXISTS idx_observations_routes;
+DROP INDEX IF EXISTS idx_observations_stops;
+DROP INDEX IF EXISTS idx_observations_service_date;
+CREATE INDEX IF NOT EXISTS idx_observations_sd_route ON observations (service_date, route_id, delay_seconds);
+CREATE INDEX IF NOT EXISTS idx_observations_sd_stop ON observations (service_date, stop_id, delay_seconds);
 CREATE INDEX IF NOT EXISTS idx_observations_poll_ts ON observations (poll_timestamp);
+-- Covers service_date_stats (GROUP BY service_date, MAX(poll_timestamp)).
+CREATE INDEX IF NOT EXISTS idx_observations_sd_poll ON observations (service_date, poll_timestamp);
 """
 
 
@@ -141,26 +151,28 @@ class ObservationsDB:
 
     def _rollup_by_filter(self, column: str, where: str, params) -> dict[str, dict]:
         rows = self.conn.execute(
-            f"SELECT {column}, category, COUNT(*), SUM(delay_seconds) "
+            f"SELECT {column}, "
+            "  COUNT(*), "
+            "  SUM(delay_seconds), "
+            f"  SUM(CASE WHEN delay_seconds < {EARLY_TOLERANCE_SECONDS} THEN 1 ELSE 0 END), "
+            f"  SUM(CASE WHEN delay_seconds >= {EARLY_TOLERANCE_SECONDS} "
+            f"           AND delay_seconds <= {LATE_TOLERANCE_SECONDS} THEN 1 ELSE 0 END), "
+            f"  SUM(CASE WHEN delay_seconds > {LATE_TOLERANCE_SECONDS} THEN 1 ELSE 0 END) "
             "FROM observations "
             f"WHERE {where} "
-            f"GROUP BY {column}, category",
+            f"GROUP BY {column}",
             params,
         ).fetchall()
 
         totals = {}
-        for key, category, count, delay_sum in rows:
-            t = totals.setdefault(
-                key,
-                {
-                    "total_observations": 0,
-                    **{k: 0 for k in CATEGORY_COUNT_KEYS},
-                    "delay_sum": 0,
-                },
-            )
-            t["total_observations"] += count
-            t[f"{category}_count"] += count
-            t["delay_sum"] += delay_sum or 0
+        for key, total, delay_sum, early, on_time, late in rows:
+            totals[key] = {
+                "total_observations": total,
+                "on_time_count": on_time,
+                "early_count": early,
+                "late_count": late,
+                "delay_sum": delay_sum or 0,
+            }
         return totals
 
     def rollup_routes(self, service_date) -> dict[str, dict]:
@@ -180,11 +192,24 @@ class ObservationsDB:
         return self._rollup_by_filter("stop_id", "poll_timestamp >= ?", (int(unix_ts),))
 
     def _rollup_by_dates(self, column: str, dates) -> dict[str, dict]:
-        dates = [to_iso_date(d) for d in dates]
-        if not dates:
-            return {}
-        placeholders = ",".join("?" * len(dates))
-        return self._rollup_by_filter(column, f"service_date IN ({placeholders})", tuple(dates))
+        """Per-date rollups merged.
+
+        A single `service_date = ?` is a covering index range scan with no temp
+        b-tree (route_id/stop_id are ordered within the date), unlike a
+        multi-date `service_date IN (...)` which forces a temp b-tree over the
+        whole window.
+        """
+        out: dict[str, dict] = {}
+        for d in dates:
+            for key, totals in self._rollup_by(column, d).items():
+                if key in out:
+                    t = out[key]
+                    for k in ("total_observations", "on_time_count",
+                              "early_count", "late_count", "delay_sum"):
+                        t[k] = t.get(k, 0) + totals.get(k, 0)
+                else:
+                    out[key] = dict(totals)
+        return out
 
     def rollup_routes_for_dates(self, dates) -> dict[str, dict]:
         """Per-route totals over the given service dates (used by the week window)."""
@@ -200,6 +225,17 @@ class ObservationsDB:
             "SELECT service_date, MAX(poll_timestamp) FROM observations "
             "GROUP BY service_date ORDER BY service_date"
         ).fetchall()
+
+    def store_dates(self) -> list[str]:
+        """Service dates present in the store, oldest first (no MAX lookup).
+
+        Cheap enough for the hot path (build_current/main), unlike
+        service_date_stats which scans the poll_timestamp index for per-date
+        MAX values.
+        """
+        return [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT service_date FROM observations ORDER BY service_date"
+        ).fetchall()]
 
     def last_service_date_for_routes(self, route_ids) -> dict[str, str]:
         """Newest service_date per route_id — closes dropped routes on static refresh."""

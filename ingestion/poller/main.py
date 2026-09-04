@@ -220,7 +220,7 @@ def main():
         db.upsert(rows)
 
         present = {r["service_date"] for r in rows}
-        store_dates = [sd for sd, _ in db.service_date_stats()]
+        store_dates = db.store_dates()
         current_sd = (
             max(present).isoformat()
             if present
@@ -239,7 +239,9 @@ def main():
         for sd in refresh_daily_chronicle(db, str(STATE_DIR), current_sd):
             s3.upload(f"state/daily/{sd}.json", STATE_DIR / "daily" / f"{sd}.json")
 
+        t_rollup = time.perf_counter()
         current = build_current(db, metadata, str(STATE_DIR), current_sd=current_sd)
+        _log_time("rollup", time.perf_counter() - t_rollup)
         write_json(current, STATE_DIR / "current.json")
         s3.upload("public/current.json", STATE_DIR / "current.json", cache_control=CURRENT_CACHE_CONTROL)
 

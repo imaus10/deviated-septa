@@ -230,21 +230,35 @@ def build_current(obs_db, static: dict, state_dir, now=None, since_seconds: int 
     now = now or datetime.now(EASTERN)
     hour_since = int(now.timestamp()) - since_seconds
 
-    stats = obs_db.service_date_stats()
-    store_dates = [sd for sd, _ in stats]
+    store_dates = obs_db.store_dates()
     if current_sd is None:
         current_sd = store_dates[-1] if store_dates else now.date().isoformat()
 
     hour = build_totals_since(obs_db, hour_since)
     day = build_totals(obs_db, current_sd)
 
-    week = {
-        "routes": obs_db.rollup_routes_for_dates(_week_dates(current_sd)),
-        "stops": obs_db.rollup_stops_for_dates(_week_dates(current_sd)),
-    }
+    # week = today's store rollup (already `day`) + the six prior dates'
+    # finalized daily archives. refresh_daily_chronicle runs just before this
+    # and rewrites any prior date whose store advanced, so the archives are
+    # current; a date without one (rare) falls back to a store scan.
+    week_dates = _week_dates(current_sd)
+    week_routes = dict(day["routes"])
+    week_stops = dict(day["stops"])
+    for sd in week_dates[1:]:
+        daily = load_daily(state_dir, sd)
+        if daily:
+            week_routes = merge_entity_map(week_routes, daily["routes"])
+            week_stops = merge_entity_map(week_stops, daily["stops"])
+        else:
+            week_routes = merge_entity_map(week_routes, obs_db.rollup_routes(sd))
+            week_stops = merge_entity_map(week_stops, obs_db.rollup_stops(sd))
+    week = {"routes": week_routes, "stops": week_stops}
 
     baseline = load_baseline(state_dir)
-    recent = {
+    # The store is pruned to the same 7-date window as `week`, so reuse the
+    # week rollup for `all` instead of scanning the window twice. Only on the
+    # first poll after a restore do store_dates and the week window differ.
+    recent = week if set(store_dates) == set(week_dates) else {
         "routes": obs_db.rollup_routes_for_dates(store_dates),
         "stops": obs_db.rollup_stops_for_dates(store_dates),
     }
