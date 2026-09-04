@@ -258,7 +258,7 @@ onMounted(() => {
   const highlightPane = map.createPane("highlightPane");
   highlightPane.style.zIndex = 640;
 
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=cb1_2e17_1_7cd98ab06074d6e0bf46768f", {
     attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OSM</a> &copy; <a href=\"https://carto.com/\">CARTO</a>",
     maxZoom: 18,
   }).addTo(map);
