@@ -75,6 +75,10 @@ def patch_deps(monkeypatch, tmp_path):
     fake.objects["archive/stops.parquet"] = "x"
     monkeypatch.setattr(s3, "_make_client", lambda: fake)
 
+    # Pin "today" to the fixture's newest date so the partial-today behavior is
+    # deterministic regardless of the wall clock.
+    monkeypatch.setattr(cutover, "_eastern_today", lambda: TODAY)
+
     monkeypatch.setattr(cutover, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(cutover, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(cutover, "STATIC_DB", tmp_path / "state" / "static.db")

@@ -5,23 +5,22 @@
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Node.js 18+ (for frontend only)
-- A [Neon](https://neon.com) free-tier project
+- AWS: an S3 bucket + poller IAM creds (see `infra/`; dev or prod via OpenTofu)
 
 ---
 
 ## 1. Environment variables
 
-```bash
-neon env pull
-```
-
-This writes `DATABASE_URL` and `DATABASE_URL_UNPOOLED` to `.env` from your Neon project. Alternatively, copy `.env.example` and fill in the values manually.
+Copy `.env.example` to `.env` and fill in:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | Pooled Postgres connection — poller runtime, app queries |
-| `DATABASE_URL_UNPOOLED` | Unpooled connection — Alembic migrations, bulk imports |
-| `FRONTEND_READER_PASSWORD` | Password for the `frontend_reader` role (used by setup script) |
+| `S3_BUCKET` | S3 bucket name (`deviated-septa-dev` or `-prod`) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Poller IAM creds (bucket-scoped) |
+| `VITE_PUBLIC_URL` | Frontend data source — the S3 `public/` URL the dashboard fetches `current.json` + `geometries.json` from |
+
+Prod creds live in a separate `.env.prod` (gitignored); the poller/cutover scripts load it via
+`--env-file` or pre-exported vars.
 
 ---
 
@@ -34,142 +33,94 @@ cd ../frontend && npm install
 
 ---
 
-## 3. Run migrations
-
-```bash
-cd ingestion && uv run alembic upgrade head
-```
-
-Creates all tables and aggregation functions in Neon.
-
----
-
-## 4. Create read-only role for frontend
-
-```bash
-source .env && psql "$DATABASE_URL" -v frontend_reader_password="$FRONTEND_READER_PASSWORD" -f ingestion/scripts/setup_readonly_role.sql
-```
-
-Creates a `frontend_reader` role with SELECT-only access to `latest_snapshot`. The frontend queries Neon directly using this role. Idempotent — safe to re-run.
-
----
-
-## 5. Import GTFS static + test poller
+## 3. Bootstrap static data + run the poller
 
 ```bash
 cd ingestion && uv run python -m poller.main
 ```
 
-Downloads SEPTA's GTFS static feed, imports it, fetches real-time predictions, and runs aggregations. Verify with:
+On first run this downloads SEPTA's GTFS static feed into `data/`, builds the SQLite `StaticDB`
+(`state/static.db`), fetches real-time predictions, and rolls up `state/current.json`. It then
+uploads `public/*` to S3 (best-effort).
 
-```bash
-psql "$DATABASE_URL" -c "SELECT route_id, on_time_percentage FROM latest_snapshot WHERE period = 'daily' ORDER BY total_observations DESC LIMIT 5;"
+Local state layout (all under `ingestion/`):
+
+```
+data/                  # GTFS static zip + freshness (mutable, downloaded)
+state/                 # runtime + rollups
+  observations.db      # 7-service-date live observations window (SQLite)
+  static.db            # StaticDB (stop_times + trips)
+  current.json         # 4-period rollup
+  all-baseline.json    # all-time folded totals
+  daily/<sd>.json      # per-service-date chronicle
+  archive/             # local parquet scratch (deleted after upload)
 ```
 
 ---
 
-## 6. Raspberry Pi (primary poller)
+## 4. Restore / cut over from the S3 ledger
 
-The poller runs every minute from a Pi with direct Postgres access.
+If you're bootstrapping from the S3 archive (DR) or cutting the Pi over from Neon:
+
+```bash
+cd ingestion && uv run python -m scripts.cutover --apply --env-file ../.env.prod
+```
+
+`cutover.py` (dry-run by default) restores the 7-date store window + baseline from
+`archive/observations/*.parquet`, uploads `public/geometries.json`, and verifies. To rebuild
+local state from S3 only, use `scripts/restore_state.py`.
+
+---
+
+## 5. Raspberry Pi (primary poller)
+
+The poller runs every minute from a Pi.
 
 ### Initial setup
 
 ```bash
 git clone <repo-url> deviated-septa
 cd deviated-septa
-neon env pull
-cd ingestion && uv sync --frozen
-```
-
-Debian-based Pis need `libpq-dev` for `psycopg2-binary`:
-
-```bash
-sudo apt update && sudo apt install -y libpq-dev
+# write .env with the S3_* vars
+cd ingestion && uv sync --extra dev
 ```
 
 ### Cron (every minute)
-
-```bash
-crontab -e
-```
-
-Add:
 
 ```
 * * * * * timeout 420 flock -n /tmp/poller.lock sh -c 'cd /home/austinblanton/Desktop/deviated-septa/ingestion && /path/to/uv run python -m poller.main' >> /tmp/poller.log 2>&1
 ```
 
-Notes on the cron command:
-- `timeout 420` kills the process if a cycle takes longer than 420s (7 min). Normal cycles are ~13s, but a GTFS static reimport can take ~5 min. Prevents a hung process from holding the flock and silently killing all future runs.
-- `flock -n` skips a cycle if the previous one is still running.
-- `sh -c '...'` is needed because `flock` exec's the next argument as a binary, but `cd` is a shell built-in.
-- **Adjust paths** — replace with your actual Pi home directory. Run `echo $HOME` to confirm.
-- **Find `uv`** — cron's default PATH doesn't include `~/.local/bin`. Run `which uv` and substitute that absolute path.
-
-### Monitor
-
-```bash
-tail -f /tmp/poller.log
-tail -f /var/log/wifi-watchdog.log    # wifi watchdog (see below)
-```
-
-### Ensure cron survives reboot
-
-```bash
-sudo systemctl enable cron
-```
+Notes:
+- `timeout 420` kills a hung cycle; `flock -n` skips if the previous run is still going.
+- Adjust paths to your Pi home; use the absolute `uv` path (`which uv`).
 
 ### WiFi resilience (recommended)
 
-Recover from wifi drops without manual power-cycling. Two parts:
-
-1. **Never give up reconnecting** (per profile, persists across reboots):
-   ```bash
-   sudo nmcli connection modify "Verizon_CK4G7P" connection.autoconnect-retries -1
-   ```
-   Verify: `nmcli -g connection.autoconnect-retries connection show "Verizon_CK4G7P"` → `-1`.
-
-2. **Watchdog** — `ingestion/scripts/wifi-watchdog.sh`, run every minute. It pings the gateway then 8.8.8.8 (only counts a failure if both are unreachable), force-reactivates the connection after 3 consecutive failures, and reboots after 6 (writes a durable marker first). Log: `/var/log/wifi-watchdog.log` (survives reboots); a successful check after a watchdog reboot logs `link restored via reboot`.
-
-   Needs passwordless sudo to write /var/log and call `nmcli`/`systemctl` (already present if `sudo -n true` works):
-   ```bash
-   chmod +x ingestion/scripts/wifi-watchdog.sh
-   crontab -e   # add:
-   ```
-   ```
-   * * * * * flock -n /tmp/wifi-watchdog.lock sudo -n /home/austinblanton/Desktop/deviated-septa/ingestion/scripts/wifi-watchdog.sh
-   ```
-
-   Monitor: `tail -f /var/log/wifi-watchdog.log`
+1. `sudo nmcli connection modify "Verizon_CK4G7P" connection.autoconnect-retries -1`
+2. `ingestion/scripts/wifi-watchdog.sh` from cron every minute (reconnects after 3 failures,
+   reboots after 6): `* * * * * flock -n /tmp/wifi-watchdog.lock sudo -n /home/austinblanton/Desktop/deviated-septa/ingestion/scripts/wifi-watchdog.sh`
 
 ---
 
-## 7. Frontend dev & deploy
+## 6. Frontend dev & deploy
 
 ```bash
 cd frontend
-npm run dev            # local dev (hot-reload) — targets Neon
-npm run build          # production build → dist/
+npm run dev      # local dev (hot-reload) — fetches from VITE_PUBLIC_URL
+npm run build    # production build → dist/
 ```
 
-For local dev against a Postgres database instead of Neon, run `VITE_NEON_FETCH_ENDPOINT=/sql npm run dev` — the Vite dev server serves a `/sql` endpoint that mimics the Neon HTTP protocol. Restart the dev server after toggling between the two.
+Set `VITE_PUBLIC_URL` in root `.env` to a reachable data source (e.g. the dev bucket's
+`https://deviated-septa-dev.s3.amazonaws.com/public`) to develop against real data.
+
+Deploy: push to `main` touching `frontend/**` → `.github/workflows/deploy.yml` builds with the
+`VITE_PUBLIC_URL` GitHub secret and publishes to GitHub Pages. Set the secret to the S3 `public/`
+URL (CloudFront domain when `use_cloudfront=true`, otherwise the bucket endpoint).
 
 ---
 
-## 8. Schema change workflow
+## 7. Historical import from Neon (temporary)
 
-1. Edit `ingestion/poller/models.py`
-2. `cd ingestion && alembic revision --autogenerate -m "description"`
-3. Review the generated file in `ingestion/migrations/versions/`
-4. Test locally: `cd ingestion && alembic upgrade head`
-5. Commit the migration
-6. Run `alembic upgrade head` against Neon — stop the Pi cron first, since the old poller binary may call aggregation functions dropped by the migration
-
----
-
-## Export production data to local
-
-```bash
-pg_dump --no-owner --no-acl "$DATABASE_URL" > prod_dump.sql
-psql -d deviated_septa_dev < prod_dump.sql
-```
+The one-off Neon → S3 import lives in `ingestion/scripts/migrate_neon.py` (needs `psycopg2` +
+`DATABASE_URL*`). It is being retired after the Pi cutover completes; do not build on it.
