@@ -26,71 +26,209 @@ def _db_with_days(tmp_path, days):
     return db
 
 
+def test_delete_service_date_batches(tmp_path):
+    db = ObservationsDB(tmp_path / "obs.db")
+    rows = [{**_row("2026-08-28"), "trip_id": f"T{i}"} for i in range(25)]
+    rows.append(_row("2026-08-29"))
+    db.upsert(rows)
+
+    n = db.delete_service_date("2026-08-28", batch=10)  # 3 batches
+
+    assert n == 25
+    assert db.count("2026-08-28") == 0
+    assert db.count("2026-08-29") == 1  # other dates untouched
+
+
 def test_archives_elapsed_dates_and_deletes_local(monkeypatch, tmp_path):
     db = _db_with_days(tmp_path, ["2026-08-28", "2026-08-29"])
-    exists = set()
     uploaded = []
     written = []
 
-    def fake_exists(key):
-        return key in exists
-
-    def fake_write(rows, obs_dir):
+    def fake_write(rows, obs_dir, **kw):
         p = tmp_path / "staged.parquet"
         p.write_bytes(b"data")
-        written.append((rows, obs_dir))
+        written.append((rows, obs_dir, kw.get("as_of_poll")))
         return p
 
-    monkeypatch.setattr(main.s3, "object_exists", fake_exists)
+    monkeypatch.setattr(main.archives, "read_archive_meta", lambda *a, **k: (None, None))
     monkeypatch.setattr(main.archives, "write_observations", fake_write)
     monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
 
-    main._archive_elapsed_dates(db, current_sd="2026-08-30")
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
 
-    # both elapsed dates archived, current skipped
+    # both elapsed dates archived (feed is on 08-30, both are quiet), local deleted
     assert set(uploaded) == {
         "archive/observations/2026-08-28.parquet",
         "archive/observations/2026-08-29.parquet",
     }
-    # local file deleted after successful upload
+    assert all(ap is not None for _, _, ap in written)  # as_of_poll baked into metadata
     assert not (tmp_path / "staged.parquet").exists()
 
 
-def test_skips_dates_already_on_s3(monkeypatch, tmp_path):
+def test_skips_dates_already_archived_through(monkeypatch, tmp_path):
     db = _db_with_days(tmp_path, ["2026-08-28", "2026-08-29"])
-    exists = {"archive/observations/2026-08-28.parquet"}
     uploaded = []
 
-    monkeypatch.setattr(main.s3, "object_exists", lambda key: key in exists)
+    monkeypatch.setattr(
+        main.archives,
+        "read_archive_meta",
+        lambda path, filesystem=None: (10 ** 12, 1) if "2026-08-28.parquet" in path else (None, None),
+    )
     monkeypatch.setattr(
         main.archives,
         "write_observations",
-        lambda rows, obs_dir: (
+        lambda rows, obs_dir, **kw: (
             (tmp_path / "staged.parquet").write_bytes(b"data"),
             tmp_path / "staged.parquet",
         )[1],
     )
     monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
 
-    main._archive_elapsed_dates(db, current_sd="2026-08-30")
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
 
-    # 08-28 already archived on S3 -> not re-uploaded; 08-29 still done
+    # 08-28 already archived through its max poll -> not re-uploaded; 08-29 done
     assert uploaded == ["archive/observations/2026-08-29.parquet"]
+
+
+def test_rearchives_when_store_advanced_past_archive(monkeypatch, tmp_path):
+    db = _db_with_days(tmp_path, ["2026-08-29"])
+    uploaded = []
+
+    monkeypatch.setattr(main.archives, "read_archive_meta", lambda *a, **k: (0, 1))  # stale, store holds 1
+    monkeypatch.setattr(
+        main.archives,
+        "write_observations",
+        lambda rows, obs_dir, **kw: (
+            (tmp_path / "staged.parquet").write_bytes(b"data"),
+            tmp_path / "staged.parquet",
+        )[1],
+    )
+    monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
+
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
+
+    assert uploaded == ["archive/observations/2026-08-29.parquet"]
+
+
+def test_skips_rearchive_when_store_is_partial(monkeypatch, tmp_path):
+    db = _db_with_days(tmp_path, ["2026-08-29"])
+    uploaded = []
+
+    monkeypatch.setattr(
+        main.archives,
+        "read_archive_meta",
+        lambda *a, **k: (0, 1000),  # archive has 1000 rows; store has 1 (mid-drain)
+    )
+    monkeypatch.setattr(
+        main.archives,
+        "write_observations",
+        lambda rows, obs_dir, **kw: (
+            (tmp_path / "staged.parquet").write_bytes(b"data"),
+            tmp_path / "staged.parquet",
+        )[1],
+    )
+    monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
+
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
+
+    assert uploaded == []  # refused to overwrite a complete archive from a partial store
+
+
+def test_skips_rearchive_when_archive_footer_unreadable(monkeypatch, tmp_path, capsys):
+    """Regression: a transient footer read must never be read as 'not archived'.
+
+    On 2026-09-08 a read error returned (None, None), which silently disabled
+    both the as_of_poll check and the mid-drain row-count guard, so a partial
+    store overwrote a complete archive (770,789 -> 36,449 rows).
+    """
+    db = _db_with_days(tmp_path, ["2026-08-29"])
+    uploaded = []
+    written = []
+
+    def boom(*a, **k):
+        raise TimeoutError("S3 timed out")
+
+    monkeypatch.setattr(main.archives, "read_archive_meta", boom)
+    monkeypatch.setattr(
+        main.archives,
+        "write_observations",
+        lambda rows, obs_dir, **kw: written.append(rows) or (tmp_path / "staged.parquet"),
+    )
+    monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
+
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
+
+    assert uploaded == []   # archive left untouched
+    assert written == []   # and nothing even staged
+    assert "refusing to overwrite" in capsys.readouterr().out
+
+
+def test_archives_when_archive_absent_not_found(monkeypatch, tmp_path):
+    """FileNotFoundError from the footer read means 'nothing archived yet'."""
+    db = _db_with_days(tmp_path, ["2026-08-29"])
+    uploaded = []
+
+    def missing(*a, **k):
+        raise FileNotFoundError("no such key")
+
+    monkeypatch.setattr(main.archives, "read_archive_meta", missing)
+    monkeypatch.setattr(
+        main.archives,
+        "write_observations",
+        lambda rows, obs_dir, **kw: (
+            (tmp_path / "staged.parquet").write_bytes(b"data"),
+            tmp_path / "staged.parquet",
+        )[1],
+    )
+    monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
+
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
+
+    assert uploaded == ["archive/observations/2026-08-29.parquet"]
+
+
+def test_no_archive_while_date_in_feed(monkeypatch, tmp_path):
+    db = _db_with_days(tmp_path, ["2026-08-29"])
+    uploaded = []
+    monkeypatch.setattr(main.archives, "read_archive_meta", lambda *a, **k: (None, None))
+    monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
+
+    # 08-29 is still in the feed -> min(present)=08-29, so 08-29 is not < min
+    main._archive_elapsed_dates(db, present={"2026-08-29", "2026-08-30"})
+
+    assert uploaded == []
+
+
+def test_no_archive_while_not_quiet(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    db = ObservationsDB(tmp_path / "obs.db")
+    row = _row("2026-08-29")
+    row["poll_timestamp"] = datetime.now(timezone.utc)  # updated just now -> not quiet
+    db.upsert([row])
+    uploaded = []
+
+    monkeypatch.setattr(main.archives, "read_archive_meta", lambda *a, **k: (None, None))
+    monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: uploaded.append(key) or True)
+
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
+
+    assert uploaded == []  # feed moved past 08-29 but it's still being updated
 
 
 def test_keeps_local_on_upload_failure(monkeypatch, tmp_path):
     db = _db_with_days(tmp_path, ["2026-08-29"])
 
-    def fake_write(rows, obs_dir):
+    def fake_write(rows, obs_dir, **kw):
         p = tmp_path / "staged.parquet"
         p.write_bytes(b"data")
         return p
 
-    monkeypatch.setattr(main.s3, "object_exists", lambda key: False)
+    monkeypatch.setattr(main.archives, "read_archive_meta", lambda *a, **k: (None, None))
     monkeypatch.setattr(main.archives, "write_observations", fake_write)
     monkeypatch.setattr(main.s3, "upload", lambda key, path, **meta: False)
 
-    main._archive_elapsed_dates(db, current_sd="2026-08-30")
+    main._archive_elapsed_dates(db, present={"2026-08-30"})
 
     # local parquet survives a failed upload so the next cycle can retry
     assert (tmp_path / "staged.parquet").exists()

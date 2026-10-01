@@ -61,8 +61,11 @@ through CloudFront OAC when `use_cloudfront=true`); `state/` + `archive/` are pr
    `Last-Modified`; if changed (or first run), download the zip, `import_to_sqlite` (streams
    stop_times/trips into `StaticDB`, scoped to bus/trolley), and regenerate + upload
    geometries/registries. Unchanged: just open the existing SQLite store — the hot path never
-   materializes stop_times.
-2. **Fetch + parse** GTFS-RT protobuf.
+   materializes stop_times. A transient network error (WiFi/DNS) falls back to the local feed
+   (treated as unchanged) and only raises when there is no local feed (bootstrap).
+2. **Fetch + parse** GTFS-RT protobuf — `gtfs_rt.fetch_trip_updates` retries once (fetch+parse
+   as one unit, so a truncated body also recovers); if it still fails, `FeedUnavailable` is
+   caught and the cycle is **skipped** cleanly (store/`current.json` untouched, next tick retries).
 3. **Extract observations** — `gtfs_rt.extract_observations(feed, static)` does per-stop point
    lookups (`static.stop_time`) and bakes `stop_id` into each observation; `main` adds
    `route_id` (`static.route_for_trip`) + category.
@@ -70,12 +73,27 @@ through CloudFront OAC when `use_cloudfront=true`); `state/` + `archive/` are pr
    prediction wins).
 5. **Archive elapsed dates** — any store date strictly before `current_sd` that isn't already on
    S3 is written to `archive/observations/<sd>.parquet` and uploaded, then the local copy is
-   removed (S3 is the eternal ledger). Skipped if already present (exists-skip).
+   removed (S3 is the eternal ledger). Skipped if already present (exists-skip). Overwrite is
+   **fail-closed**: an existing archive is replaced only when its footer read succeeds and the
+   store still holds a full day (not mid-drain); an unreadable footer is skipped, never overwritten.
 6. **Prune** — dates older than the 7-date window are folded into the all-time baseline
    (`all-baseline.json`), deleted from the store, and the daily chronicle is refreshed.
 7. **Rollup** — `rollup.build_current` builds `current.json` (periods hour/day/week/all, all
    data-driven: `current_service_date` = newest service date in the feed, never wall-clock).
 8. **Uploads** are best-effort (warn, never crash). `s3.upload` retries once.
+
+### Data integrity notes
+
+- **Known raw-ledger gap: `2026-09-08`.** That archive holds 36,449 rows instead of the full
+  770,789 (the rest are unrecoverable — Neon only holds `2026-07-21..2026-09-04`, and the store
+  had drained). A transient footer-read failure made the old guard read as "not archived",
+  letting a partial store overwrite it. The fix is the fail-closed archive guard above. The
+  rollup stays correct: the 09-08 daily + folded `all-baseline.json` retain the full totals, so
+  only the raw parquet is short. **Do not run `scripts/rebuild_baseline.py`** — it would fold the
+  short ledger into the baseline and corrupt the (correct) rollup to match the lossy parquet.
+  `scripts/restore_state.py` therefore folds finalized dates from the S3 daily chronicle rather than
+  the raw parquet, so a DR restore reproduces the full 770,789 and logs a warning about the gap.
+
 
 ### Key files (ingestion)
 
@@ -83,13 +101,13 @@ through CloudFront OAC when `use_cloudfront=true`); `state/` + `archive/` are pr
 |------|------|
 | `poller/main.py` | One poll cycle (steps above). |
 | `poller/gtfs_static.py` | `StaticDB` (SQLite stop_times+trips, point lookups + iteration), `check_and_update()`, `import_to_sqlite()`, `load_local_metadata()` (routes/stops/calendar only), `active_route_ids()`. |
-| `poller/gtfs_rt.py` | Fetch/parse protobuf, `extract_observations(feed, static)`, `infer_service_date`/`scheduled_to_ts`, `classify()`. |
+| `poller/gtfs_rt.py` | `fetch_trip_updates()` (retrying fetch+parse, raises `FeedUnavailable`), `extract_observations(feed, static)`, `infer_service_date`/`scheduled_to_ts`, `classify()`. |
 | `poller/state.py` | `ObservationsDB` (SQLite observations store), `load_archive()`, `last_service_date_for_routes()`, state.json. |
 | `poller/rollup.py` | `build_current()`, `prune_window()`, `refresh_daily_chronicle()`, baseline helpers. |
 | `poller/s3.py` | Upload/read S3 (explicit `S3_*` creds, never the default chain), pyarrow filesystem. |
 | `poller/archives.py` | Parquet writers/readers; consolidation-aware `build_registries()` (active open-ended, dropped routes closed with observation-derived `valid_to` windows, existing rows never deleted/reopened). |
 | `poller/route_geometries.py` | Spider-walk polyline generator: `build_geometries(static, metadata)` streams stop_times from StaticDB. |
-| `scripts/restore_state.py` | Rebuild local state from the S3 ledger (bootstrap/DR); streams parquet in bounded batches. |
+| `scripts/restore_state.py` | Rebuild local state from the S3 ledger (bootstrap/DR); streams parquet in bounded batches. Enumerates dates from the union of S3 archives + S3 dailies + local dailies so a date is never dropped because its archive went missing; folded dates prefer the S3 **daily chronicle** (parquet only when no daily exists, a staged local daily as the last resort, which is then re-uploaded to S3); a full restore wipes local baseline and *stages* `daily/` (removed only on success) so it can neither double-count nor destroy a date's last copy. |
 | `scripts/cutover.py` | One-shot Pi cutover: preflight → static/bootstrap+geometries → drop today's partial archive → restore → verify. Dry-run default, `--apply` to execute. |
 | `scripts/migrate_neon.py` | **Temporary** — historical Neon→S3 import (needs `psycopg2` + `DATABASE_URL*`). Remove once the migration is fully retired. |
 

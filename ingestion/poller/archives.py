@@ -57,11 +57,13 @@ OBSERVATION_SCHEMA = pa.schema(
 )
 
 
-def write_observations(rows, observations_dir) -> Path:
+def write_observations(rows, observations_dir, as_of_poll=None) -> Path:
     """Write raw observation rows for one service date to parquet.
 
-    `rows` are tuples from ObservationsDB.export_day() (empty rows raise). Returns
-    the written path, atomically (tmp + rename).
+    `rows` are tuples from ObservationsDB.export_day() (empty rows raise).
+    `as_of_poll` (unix ts) is stored in the parquet footer metadata so callers
+    can tell whether a later overwrite captured newer rows. Returns the
+    written path, atomically (tmp + rename).
     """
     if not rows:
         raise ValueError("cannot write an empty observations archive")
@@ -74,7 +76,42 @@ def write_observations(rows, observations_dir) -> Path:
         ],
         schema=OBSERVATION_SCHEMA,
     )
+    if as_of_poll is not None:
+        table = table.replace_schema_metadata(
+            {**(table.schema.metadata or {}), b"as_of_poll": str(int(as_of_poll)).encode()}
+        )
     return _atomic_write(table, observations_dir, f"{service_date}.parquet")
+
+
+def read_archive_as_of_poll(path, filesystem=None) -> int | None:
+    """Last-archived max poll timestamp (footer metadata), or None if absent.
+
+    Returns None when the object doesn't exist or has no as_of_poll metadata —
+    callers treat that as "nothing archived yet."
+    """
+    try:
+        pf = pq.ParquetFile(path, filesystem=filesystem)
+    except Exception:
+        return None
+    raw = (pf.metadata.metadata or {}).get(b"as_of_poll")
+    return int(raw) if raw is not None else None
+
+
+def read_archive_meta(path, filesystem=None) -> tuple[int | None, int | None]:
+    """(as_of_poll, num_rows) for an archive that exists.
+
+    One footer read for both values. num_rows lets callers tell whether the
+    store still holds a full day before re-archiving (a partial store must
+    never overwrite a complete archive).
+
+    Raises FileNotFoundError when the object does not exist (nothing archived
+    yet) and propagates every other error, so callers can distinguish "no
+    archive" from "archive present but its footer could not be read" and refuse
+    to overwrite a possibly-complete archive on a transient S3 error.
+    """
+    pf = pq.ParquetFile(path, filesystem=filesystem)
+    raw = (pf.metadata.metadata or {}).get(b"as_of_poll")
+    return (int(raw) if raw is not None else None), pf.metadata.num_rows
 
 
 # ---------------------------------------------------------------------------

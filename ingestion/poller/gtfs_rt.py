@@ -1,7 +1,9 @@
 import logging
+import time
 from datetime import datetime, date, timedelta, timezone
 
 import httpx
+from google.protobuf.message import DecodeError
 from google.transit import gtfs_realtime_pb2
 
 from poller.constants import (
@@ -16,6 +18,18 @@ BUS_TRIP_UPDATES = "https://www3.septa.org/gtfsrt/septa-pa-us/Trip/rtTripUpdates
 BUS_VEHICLE_POSITIONS = (
     "https://www3.septa.org/gtfsrt/septa-pa-us/Vehicle/rtVehiclePosition.pb"
 )
+
+# The Pi's WiFi drops DNS/TCP routinely; a single retry after a short pause
+# rides out most blips. If it still fails the cycle is skipped (not crashed) —
+# the next cron tick one minute later retries.
+FETCH_ATTEMPTS = 2
+FETCH_BACKOFF_SECONDS = 2.0
+TRANSIENT_NETWORK_ERRORS = (httpx.HTTPError, OSError)
+
+
+class FeedUnavailable(RuntimeError):
+    """The RT feed could not be fetched and parsed this cycle."""
+
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -52,10 +66,41 @@ def infer_service_date(arrival_time: str, predicted_ts: int) -> date:
     )
 
 
-def fetch_protobuf(url: str) -> bytes:
-    resp = httpx.get(url, follow_redirects=True, timeout=30)
-    resp.raise_for_status()
-    return resp.content
+def fetch_protobuf(url: str, attempts: int = FETCH_ATTEMPTS) -> bytes:
+    """GET the RT feed bytes, retrying on transient network/HTTP errors.
+
+    Raises FeedUnavailable on final failure (rather than the raw httpx error)
+    so callers can skip the cycle calmly instead of crashing on a WiFi blip.
+    """
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            resp = httpx.get(url, follow_redirects=True, timeout=30)
+            resp.raise_for_status()
+            return resp.content
+        except TRANSIENT_NETWORK_ERRORS as e:
+            last_err = e
+            if attempt + 1 < attempts:
+                time.sleep(FETCH_BACKOFF_SECONDS)
+    raise FeedUnavailable(f"could not fetch {url}: {last_err}") from last_err
+
+
+def fetch_trip_updates(url: str) -> gtfs_realtime_pb2.FeedMessage:
+    """Fetch and parse the feed as one retryable operation.
+
+    A dropped connection can truncate the body, which surfaces as a protobuf
+    DecodeError, so both the fetch and the parse are retried together before
+    giving up with FeedUnavailable.
+    """
+    last_err = None
+    for attempt in range(FETCH_ATTEMPTS):
+        try:
+            return parse_trip_updates(fetch_protobuf(url, attempts=1))
+        except (FeedUnavailable, DecodeError) as e:
+            last_err = e
+            if attempt + 1 < FETCH_ATTEMPTS:
+                time.sleep(FETCH_BACKOFF_SECONDS)
+    raise FeedUnavailable(f"could not fetch/parse {url}: {last_err}") from last_err
 
 
 def parse_trip_updates(raw: bytes) -> gtfs_realtime_pb2.FeedMessage:

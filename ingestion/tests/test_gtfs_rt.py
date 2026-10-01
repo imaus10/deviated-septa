@@ -1,5 +1,9 @@
 from datetime import date, datetime, timezone
 
+import httpx
+import pytest
+
+import poller.gtfs_rt as gtfs_rt
 from poller.gtfs_rt import (
     scheduled_to_ts,
     _parse_time_str,
@@ -7,6 +11,65 @@ from poller.gtfs_rt import (
     infer_service_date,
     classify,
 )
+
+
+class _FakeResponse:
+    def __init__(self, content):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+class TestFetchResilience:
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(gtfs_rt.time, "sleep", lambda *_: None)
+
+    def test_fetch_protobuf_retries_then_succeeds(self, monkeypatch):
+        calls = []
+
+        def fake_get(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                raise httpx.ConnectError("wifi blip")
+            return _FakeResponse(b"ok")
+
+        monkeypatch.setattr(gtfs_rt.httpx, "get", fake_get)
+        self._no_sleep(monkeypatch)
+
+        assert gtfs_rt.fetch_protobuf("http://x") == b"ok"
+        assert len(calls) == 2
+
+    def test_fetch_protobuf_raises_feed_unavailable(self, monkeypatch):
+        monkeypatch.setattr(
+            gtfs_rt.httpx, "get", lambda url, **kw: (_ for _ in ()).throw(httpx.ReadTimeout("down"))
+        )
+        self._no_sleep(monkeypatch)
+
+        with pytest.raises(gtfs_rt.FeedUnavailable):
+            gtfs_rt.fetch_protobuf("http://x")
+
+    def test_fetch_trip_updates_recovers_from_truncated_payload(self, monkeypatch):
+        good = gtfs_rt.gtfs_realtime_pb2.FeedMessage()
+        good.header.gtfs_realtime_version = "2.0"
+        payloads = [b"\xff\xff\xff\xff", good.SerializeToString()]
+
+        monkeypatch.setattr(
+            gtfs_rt.httpx, "get", lambda url, **kw: _FakeResponse(payloads.pop(0))
+        )
+        self._no_sleep(monkeypatch)
+
+        feed = gtfs_rt.fetch_trip_updates("http://x")
+        assert feed.header.gtfs_realtime_version == "2.0"
+
+    def test_fetch_trip_updates_raises_when_always_corrupt(self, monkeypatch):
+        monkeypatch.setattr(
+            gtfs_rt.httpx, "get", lambda url, **kw: _FakeResponse(b"\xff\xff\xff\xff")
+        )
+        self._no_sleep(monkeypatch)
+
+        with pytest.raises(gtfs_rt.FeedUnavailable):
+            gtfs_rt.fetch_trip_updates("http://x")
 
 
 class _FakeStatic:

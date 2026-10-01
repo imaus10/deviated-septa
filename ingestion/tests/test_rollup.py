@@ -209,6 +209,101 @@ class TestPruneWindow:
             db.close()
 
 
+class TestIncrementalPrune:
+    def _drainable_db(self, tmp_path):
+        db = ObservationsDB(tmp_path / "obs.db")
+        rows = [
+            _row(f"t{i}", "bus42", "S1", 10, "on_time", date(2026, 8, 10),
+                 datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+            for i in range(25)
+        ]
+        rows += [
+            _row("t9", "bus42", "S1", 10, "on_time", date(2026, 8, 19),
+                 datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)),
+            _row("t8", "bus42", "S1", 10, "on_time", date(2026, 8, 20),
+                 datetime(2026, 8, 20, 11, 30, tzinfo=timezone.utc)),
+        ]
+        db.upsert(rows)
+        return db
+
+    def test_drains_over_multiple_calls(self, tmp_path):
+        db = self._drainable_db(tmp_path)
+        try:
+            finalize_day(db, "2026-08-10", str(tmp_path))
+            baseline, changed = prune_window(db, str(tmp_path), "2026-08-20", delete_limit=5)
+            assert changed
+            assert baseline["routes"]["bus42"]["total_observations"] == 25
+            assert db.count("2026-08-10") == 20
+            assert (tmp_path / "daily" / "2026-08-10.json").exists()
+
+            baseline, changed = prune_window(db, str(tmp_path), "2026-08-20",
+                                             baseline=baseline, delete_limit=5)
+            assert not changed
+            assert baseline["routes"]["bus42"]["total_observations"] == 25
+            assert db.count("2026-08-10") == 15
+
+            while db.count("2026-08-10"):
+                prune_window(db, str(tmp_path), "2026-08-20",
+                             baseline=baseline, delete_limit=5)
+            assert not (tmp_path / "daily" / "2026-08-10.json").exists()
+            assert [sd for sd, _ in db.service_date_stats()] == ["2026-08-19", "2026-08-20"]
+        finally:
+            db.close()
+
+    def test_no_refold_when_baseline_already_has_date(self, tmp_path):
+        db = self._drainable_db(tmp_path)
+        try:
+            finalize_day(db, "2026-08-10", str(tmp_path))
+            baseline, _ = prune_window(db, str(tmp_path), "2026-08-20", delete_limit=5)
+            save_baseline(str(tmp_path), baseline)
+            baseline, changed = prune_window(db, str(tmp_path), "2026-08-20", delete_limit=5)
+            assert not changed
+            assert baseline["routes"]["bus42"]["total_observations"] == 25
+        finally:
+            db.close()
+
+    def test_all_no_double_count_mid_drain(self, tmp_path):
+        db = self._drainable_db(tmp_path)
+        try:
+            finalize_day(db, "2026-08-10", str(tmp_path))
+            baseline, _ = prune_window(db, str(tmp_path), "2026-08-20", delete_limit=5)
+            save_baseline(str(tmp_path), baseline)
+            current = build_current(db, STATIC, str(tmp_path), now=NOW)
+            # 08-10 is folded (25 obs) and still draining (20 store rows) — `all`
+            # must count it once from the baseline, not via the store too.
+            assert current["periods"]["all"]["routes"]["bus42"]["total_observations"] == 27
+            assert current["data_range"]["min"] == "2026-08-10"
+        finally:
+            db.close()
+
+    def test_refresh_skips_folded_dates(self, tmp_path):
+        db = self._drainable_db(tmp_path)
+        try:
+            finalize_day(db, "2026-08-10", str(tmp_path))
+            baseline, _ = prune_window(db, str(tmp_path), "2026-08-20", delete_limit=5)
+            stats = db.service_date_stats()  # stale: still lists 08-10 (mid-drain)
+            while db.count("2026-08-10"):
+                prune_window(db, str(tmp_path), "2026-08-20",
+                             baseline=baseline, delete_limit=5)
+
+            # With the guard, the folded/drained date is left alone.
+            rewritten = refresh_daily_chronicle(
+                db, str(tmp_path), "2026-08-20",
+                stats=stats, folded_through=baseline.get("max_service_date"),
+            )
+            assert "2026-08-10" not in rewritten
+            assert not (tmp_path / "daily" / "2026-08-10.json").exists()
+
+            # Without the guard, the stale stats re-finalize it against the now
+            # empty store — the bug that emptied 09-03/09-04.
+            rewritten = refresh_daily_chronicle(
+                db, str(tmp_path), "2026-08-20", stats=stats)
+            assert "2026-08-10" in rewritten
+            assert load_daily(str(tmp_path), "2026-08-10")["routes"] == {}
+        finally:
+            db.close()
+
+
 class TestRefreshDailyChronicle:
     def test_rewrites_only_when_store_advances(self, tmp_path):
         db = _today_db(tmp_path)

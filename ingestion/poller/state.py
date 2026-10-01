@@ -66,8 +66,11 @@ class ObservationsDB:
     def __init__(self, db_path):
         self.db_path = str(db_path)
         pathlib.Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # NORMAL = WAL-safe, no fsync per commit (recent commits may be lost on a
+        # hard power failure, but not corrupted) — much faster on the Pi's SD.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
@@ -259,13 +262,46 @@ class ObservationsDB:
             (to_iso_date(service_date),),
         ).fetchall()
 
-    def delete_service_date(self, service_date) -> None:
-        """Drop all rows for a service date (after archiving to parquet)."""
-        self.conn.execute(
-            "DELETE FROM observations WHERE service_date = ?",
-            (to_iso_date(service_date),),
+    def delete_service_date(self, service_date, batch=50000) -> int:
+        """Drop all rows for a service date in batches (commits between chunks).
+
+        A single DELETE of ~800K rows writes a ~270MB WAL that can't checkpoint
+        on a slow card; chunking keeps the WAL small so each commit's
+        auto-checkpoint completes. Returns rows deleted, logging progress so
+        the (minutes-long) prune announces itself instead of looking hung.
+        """
+        sd = to_iso_date(service_date)
+        deleted = 0
+        print(f"  [prune] {sd}: deleting", end="", flush=True)
+        while True:
+            cur = self.conn.execute(
+                "DELETE FROM observations WHERE service_date = ? AND trip_id IN ("
+                "  SELECT trip_id FROM observations WHERE service_date = ? LIMIT ?)",
+                (sd, sd, batch),
+            )
+            self.conn.commit()
+            deleted += cur.rowcount
+            print(".", end="", flush=True)
+            if cur.rowcount < batch:
+                print(f" [{deleted:,} rows]", flush=True)
+                return deleted
+
+    def delete_service_date_chunk(self, service_date, limit) -> int:
+        """Delete up to `limit` rows for a service date; commit + return count.
+
+        One committed chunk — the incremental prune calls this once per poll so
+        an aged-out date drains over many cycles instead of stalling the poll.
+        Already-deleted rows are gone, so repeated calls always target fresh
+        rows; the date is fully drained when the caller sees count() == 0.
+        """
+        sd = to_iso_date(service_date)
+        cur = self.conn.execute(
+            "DELETE FROM observations WHERE service_date = ? AND trip_id IN ("
+            "  SELECT trip_id FROM observations WHERE service_date = ? LIMIT ?)",
+            (sd, sd, limit),
         )
         self.conn.commit()
+        return cur.rowcount
 
 
 def load_state(state_dir) -> dict:

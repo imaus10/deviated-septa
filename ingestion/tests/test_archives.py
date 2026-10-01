@@ -57,6 +57,32 @@ class TestWriteObservations:
         assert p.name == "2026-08-27.parquet"
 
 
+class TestReadArchiveMeta:
+    def test_reads_footer_values(self, tmp_path):
+        p = archives.write_observations(
+            _obs_rows(), tmp_path / "observations", as_of_poll=1788940253
+        )
+        assert archives.read_archive_meta(p) == (1788940253, 2)
+
+    def test_missing_footer_key_reads_as_none(self, tmp_path):
+        p = archives.write_observations(_obs_rows(), tmp_path / "observations")
+        assert archives.read_archive_meta(p) == (None, 2)
+
+    def test_absent_object_raises_file_not_found(self, tmp_path):
+        # Absence must be a FileNotFoundError so callers can tell "nothing
+        # archived yet" from "archive present, footer unreadable" and refuse to
+        # overwrite in the latter case.
+        with pytest.raises(FileNotFoundError):
+            archives.read_archive_meta(tmp_path / "2099-01-01.parquet")
+
+    def test_unreadable_object_propagates_error(self, tmp_path):
+        p = tmp_path / "2026-08-27.parquet"
+        p.write_bytes(b"not a parquet file")
+        with pytest.raises(Exception) as exc:
+            archives.read_archive_meta(p)
+        assert not isinstance(exc.value, FileNotFoundError)
+
+
 class TestStreaming:
     N = 2 * archives.ROW_GROUP_SIZE + 500  # 400,500 rows -> 3 row groups
 

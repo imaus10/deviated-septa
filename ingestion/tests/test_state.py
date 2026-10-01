@@ -245,6 +245,25 @@ class TestLifecycle:
         finally:
             db.close()
 
+    def test_delete_service_date_chunk_commits_and_resumes(self, tmp_path):
+        db = ObservationsDB(tmp_path / "obs.db")
+        try:
+            db.upsert(
+                [
+                    _row(trip_id=f"t{i}", service_date=date(2026, 8, 18))
+                    for i in range(25)
+                ]
+                + [_row(trip_id="keep", service_date=date(2026, 8, 19))]
+            )
+            assert db.delete_service_date_chunk("2026-08-18", 10) == 10
+            assert db.count("2026-08-18") == 15
+            assert db.count("2026-08-19") == 1
+            assert db.delete_service_date_chunk("2026-08-18", 10) == 10
+            assert db.delete_service_date_chunk("2026-08-18", 10) == 5
+            assert db.count("2026-08-18") == 0
+        finally:
+            db.close()
+
     def test_export_day(self, tmp_path):
         db = ObservationsDB(tmp_path / "obs.db")
         try:

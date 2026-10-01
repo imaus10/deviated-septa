@@ -26,6 +26,11 @@ from poller.constants import ROUTE_SCOPE_TYPES
 
 GTFS_URL = "https://www3.septa.org/developer/gtfs_public.zip"
 
+# WiFi/DNS blips on the Pi are routine, and a static feed changes at most daily,
+# so a failed request is never fatal: the poll keeps running on the feed already
+# on disk and the next cycle retries. This is what used to crash the poll.
+TRANSIENT_NETWORK_ERRORS = (httpx.HTTPError, OSError)
+
 
 # ---------------------------------------------------------------------------
 # CSV helper
@@ -300,21 +305,46 @@ def check_and_update(data_dir: str, db_path: str) -> tuple[StaticDB, bool]:
     feed was downloaded and imported this call. The un-changed path only opens
     the existing store (no re-import, no feed materialization) — it is the
     every-minute hot path.
-    """
-    remote_freshness = fetch_freshness()
-    stored_freshness = get_stored_freshness(data_dir)
 
-    unchanged = (
-        remote_freshness == stored_freshness
-        and (pathlib.Path(data_dir) / "latest.zip").exists()
-    )
-    if unchanged:
+    Network failures are non-fatal once a feed exists locally: the freshness
+    check or the download is treated as "no update this cycle" and the poll runs
+    against the local feed. The error only propagates when there is no local
+    feed to fall back to (bootstrap), since the poller cannot run without one.
+    """
+    has_local = (pathlib.Path(data_dir) / "latest.zip").exists()
+
+    def open_local() -> tuple[StaticDB, bool]:
         if not pathlib.Path(db_path).exists():
             import_to_sqlite(data_dir, db_path)
         return StaticDB(db_path), False
 
+    try:
+        remote_freshness = fetch_freshness()
+    except TRANSIENT_NETWORK_ERRORS as e:
+        if not has_local:
+            raise
+        print(
+            f"  [static] freshness check failed ({type(e).__name__}: {e}) — "
+            "using the local feed",
+            flush=True,
+        )
+        return open_local()
+
+    if remote_freshness == get_stored_freshness(data_dir) and has_local:
+        return open_local()
+
     print("  downloading GTFS static data...", flush=True)
-    zip_bytes = download_zip()
+    try:
+        zip_bytes = download_zip()
+    except TRANSIENT_NETWORK_ERRORS as e:
+        if not has_local:
+            raise
+        print(
+            f"  [static] download failed ({type(e).__name__}: {e}) — "
+            "using the local feed",
+            flush=True,
+        )
+        return open_local()
     _save_zip(data_dir, zip_bytes, remote_freshness)
     import_to_sqlite(data_dir, db_path)
     return StaticDB(db_path), True

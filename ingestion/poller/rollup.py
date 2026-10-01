@@ -21,8 +21,10 @@ current.json shape:
 The SQLite store keeps only the 7-date week window. `week` reads the store
 directly, so it always reflects in-progress and not-yet-pruned days. The
 all-time baseline is a fixed-size accumulator: every service date that ages
-out of the window is folded into it and deleted (prune_window), so `all` =
-baseline + whatever the store still holds.
+out of the window is folded into it and drained incrementally (prune_window).
+A folded date may still have store rows draining out, so `all` excludes any
+store date already folded (d > baseline.max_service_date) from its rollup —
+the date is counted exactly once, from the baseline.
 
 Archives (private):
     state/daily/YYYY-MM-DD.json      — totals-only chronicle, rewritten whenever the
@@ -33,7 +35,7 @@ import json
 import pathlib
 from datetime import date, datetime, timedelta
 
-from poller.constants import CATEGORY_COUNT_KEYS, EASTERN
+from poller.constants import CATEGORY_COUNT_KEYS, EASTERN, PRUNE_DELETE_CHUNK
 from poller.state import to_iso_date
 
 TOTAL_KEYS = ("total_observations", *CATEGORY_COUNT_KEYS, "delay_sum")
@@ -70,6 +72,34 @@ def build_totals_since(obs_db, unix_ts) -> dict[str, dict]:
         "routes": obs_db.rollup_routes_since(unix_ts),
         "stops": obs_db.rollup_stops_since(unix_ts),
     }
+
+
+def _add_total(out: dict, key, category, delay) -> None:
+    t = out.get(key)
+    if t is None:
+        t = out[key] = {
+            "total_observations": 0,
+            **{k: 0 for k in CATEGORY_COUNT_KEYS},
+            "delay_sum": 0,
+        }
+    t["total_observations"] += 1
+    t[f"{category}_count"] += 1
+    t["delay_sum"] += delay or 0
+
+
+def accumulate_totals(routes: dict, stops: dict, batch) -> None:
+    """Fold one parquet RecordBatch's per-route/per-stop totals into dicts.
+
+    Used by restore_state.py and the baseline rebuild to turn an archive
+    stream into totals without loading it into the store.
+    """
+    rid_col = batch.column("route_id").to_pylist()
+    sid_col = batch.column("stop_id").to_pylist()
+    cat_col = batch.column("category").to_pylist()
+    delay_col = batch.column("delay_seconds").to_pylist()
+    for rid, sid, cat, delay in zip(rid_col, sid_col, cat_col, delay_col):
+        _add_total(routes, rid, cat, delay)
+        _add_total(stops, sid, cat, delay)
 
 
 def write_json(obj: dict, path) -> None:
@@ -115,41 +145,74 @@ def finalize_day(obs_db, service_date, state_dir, now=None, as_of_poll=None) -> 
     return daily
 
 
-def prune_window(obs_db, state_dir, current_sd, baseline=None, now=None) -> tuple[dict, bool]:
-    """Fold out-of-window service dates into the baseline, then drop them.
+def prune_window(obs_db, state_dir, current_sd, baseline=None, now=None, stats=None,
+                 delete_limit=PRUNE_DELETE_CHUNK) -> tuple[dict, bool]:
+    """Fold out-of-window service dates into the baseline, draining the store.
 
-    The store keeps only the 7-date week window (current_sd through -6).
-    Every older service date is folded into the all-time baseline and its
-    rows + local daily archive are deleted. Fold-then-delete makes this
-    idempotent: a date exists in exactly one of (store, baseline).
+    The store keeps only the 7-date week window (current_sd through -6). Every
+    older service date is folded into the all-time baseline and its rows +
+    local daily archive are deleted. The fold is atomic and once-only (guarded
+    by baseline.max_service_date): a date exists in exactly one of (store,
+    baseline) for `all` purposes, since build_current excludes folded dates
+    from its store rollup.
 
-    Returns (baseline, changed).
+    The store drain is incremental on purpose — each call deletes at most
+    `delete_limit` rows of each aged-out date (PRUNE_DELETE_CHUNK), one small
+    committed chunk that keeps the poll on cadence while the date drains over
+    many cycles. The baseline fold comes from the date's finalized daily
+    archive (no store scan) and is saved by the caller exactly once, on the
+    poll that first sees the date age out.
+
+    `stats` is an optional precomputed service_date_stats() (the per-date MAX
+    poll scan) so the caller can compute it once per poll instead of here.
+
+    Returns (baseline, changed) — changed is True only on a fold.
     """
     baseline = baseline if baseline is not None else load_baseline(state_dir)
     window_low = date.fromisoformat(current_sd) - timedelta(days=6)
+    folded_through = baseline.get("max_service_date")
     changed = False
-    for sd, _ in obs_db.service_date_stats():
-        if date.fromisoformat(sd) < window_low:
-            totals = build_totals(obs_db, sd)
+    for sd, _ in (stats or obs_db.service_date_stats()):
+        if date.fromisoformat(sd) >= window_low:
+            continue
+        if not folded_through or sd > folded_through:
+            daily = load_daily(state_dir, sd)
+            totals = daily if daily else {"service_date": sd, **build_totals(obs_db, sd)}
             if totals["routes"] or totals["stops"]:
-                baseline = add_to_baseline(baseline, {"service_date": sd, **totals}, now=now)
-            obs_db.delete_service_date(sd)
+                baseline = add_to_baseline(baseline, totals, now=now)
+                print(f"  [prune] folded {sd} into baseline", flush=True)
+            folded_through = sd
+            changed = True
+        n = obs_db.delete_service_date_chunk(sd, delete_limit)
+        remaining = obs_db.count(sd)
+        if remaining == 0:
             daily = pathlib.Path(state_dir) / "daily" / f"{sd}.json"
             if daily.exists():
                 daily.unlink()
-            changed = True
+            print(f"  [prune] {sd} fully pruned ({n:,} rows last chunk)", flush=True)
+        else:
+            print(f"  [prune] {sd}: {remaining:,} rows remain", flush=True)
     return baseline, changed
 
 
-def refresh_daily_chronicle(obs_db, state_dir, current_sd, now=None) -> list[str]:
+def refresh_daily_chronicle(obs_db, state_dir, current_sd, now=None, stats=None,
+                            folded_through=None) -> list[str]:
     """Rewrite daily/<sd>.json for non-current dates whose store advanced.
 
+    Dates already folded into the baseline (sd <= folded_through) are skipped:
+    the prune may have drained their store rows in the same poll, and the stats
+    passed in were computed before that, so re-finalizing would write an empty
+    daily. `folded_through` is baseline.max_service_date from the caller's prune.
+
     Returns the list of service dates whose archive was rewritten, so the
-    caller can upload them.
+    caller can upload them. `stats` is an optional precomputed
+    service_date_stats().
     """
     rewritten = []
-    for sd, mx in obs_db.service_date_stats():
+    for sd, mx in (stats or obs_db.service_date_stats()):
         if sd >= current_sd:
+            continue
+        if folded_through and sd <= folded_through:
             continue
         archive = load_daily(state_dir, sd)
         if archive is None or (mx or 0) > (archive.get("as_of_poll") or 0):
@@ -255,19 +318,25 @@ def build_current(obs_db, static: dict, state_dir, now=None, since_seconds: int 
     week = {"routes": week_routes, "stops": week_stops}
 
     baseline = load_baseline(state_dir)
-    # The store is pruned to the same 7-date window as `week`, so reuse the
-    # week rollup for `all` instead of scanning the window twice. Only on the
-    # first poll after a restore do store_dates and the week window differ.
-    recent = week if set(store_dates) == set(week_dates) else {
-        "routes": obs_db.rollup_routes_for_dates(store_dates),
-        "stops": obs_db.rollup_stops_for_dates(store_dates),
+    # A date folded into the baseline during an incremental prune may still
+    # have store rows draining out; exclude it from the store rollup so `all`
+    # doesn't double-count it (it's already in the baseline). In steady state
+    # nothing in the store is <= baseline.max_service_date, so the exclusion
+    # is a no-op. The store is pruned to the same 7-date window as `week`, so
+    # reuse the week rollup for `all` instead of scanning the window twice —
+    # once the drained date drops out, live_dates == week_dates again.
+    folded_floor = baseline.get("max_service_date")
+    live_dates = [d for d in store_dates if not folded_floor or d > folded_floor]
+    recent = week if set(live_dates) == set(week_dates) else {
+        "routes": obs_db.rollup_routes_for_dates(live_dates),
+        "stops": obs_db.rollup_stops_for_dates(live_dates),
     }
     all_totals = {
         "routes": merge_entity_map(baseline["routes"], recent["routes"]),
         "stops": merge_entity_map(baseline["stops"], recent["stops"]),
     }
 
-    mins = [m for m in (store_dates[0] if store_dates else None, baseline.get("min_service_date")) if m]
+    mins = [m for m in (live_dates[0] if live_dates else None, baseline.get("min_service_date")) if m]
     data_range = {"min": min(mins) if mins else current_sd, "max": current_sd}
 
     return {

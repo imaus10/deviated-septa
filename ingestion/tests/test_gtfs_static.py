@@ -1,8 +1,10 @@
 import io
 import csv
 import zipfile
+import httpx
 import pytest
 
+import poller.gtfs_static as gs
 from poller.gtfs_static import (
     StaticDB,
     active_route_ids,
@@ -291,3 +293,73 @@ class TestFreshness:
         data_dir = tmp_path / "gtfs-static"
         data_dir.mkdir()
         assert get_stored_freshness(str(data_dir)) is None
+
+
+# --- check_and_update network resilience ---
+
+class TestCheckAndUpdateFallback:
+    """A WiFi/DNS blip must not crash the poll when a local feed exists."""
+
+    def _local_dir(self, tmp_path, freshness="Mon, 18 Aug 2026 14:30:00 GMT"):
+        data_dir = tmp_path / "gtfs-static"
+        _save_zip(str(data_dir), make_test_zip(), freshness)
+        return data_dir
+
+    def _patch(self, monkeypatch, fetch, download):
+        calls = {"import": 0}
+        monkeypatch.setattr(gs, "fetch_freshness", fetch)
+        monkeypatch.setattr(gs, "download_zip", download)
+        monkeypatch.setattr(
+            gs, "import_to_sqlite",
+            lambda *a, **k: calls.__setitem__("import", calls["import"] + 1),
+        )
+        monkeypatch.setattr(gs, "StaticDB", lambda db_path: ("static", db_path))
+        return calls
+
+    def test_freshness_error_falls_back_to_local(self, monkeypatch, tmp_path):
+        data_dir = self._local_dir(tmp_path)
+        calls = self._patch(
+            monkeypatch,
+            lambda: (_ for _ in ()).throw(httpx.ConnectError("dns")),
+            lambda: pytest.fail("must not download"),
+        )
+
+        static, changed = gs.check_and_update(str(data_dir), str(tmp_path / "static.db"))
+
+        assert changed is False
+        assert static[0] == "static"
+        assert calls["import"] == 1  # store built from the local feed
+
+    def test_freshness_error_without_local_raises(self, monkeypatch, tmp_path):
+        data_dir = tmp_path / "gtfs-static"
+        self._patch(
+            monkeypatch,
+            lambda: (_ for _ in ()).throw(httpx.ConnectError("dns")),
+            lambda: pytest.fail("must not download"),
+        )
+
+        with pytest.raises(httpx.ConnectError):
+            gs.check_and_update(str(data_dir), str(tmp_path / "static.db"))
+
+    def test_download_error_falls_back_to_local(self, monkeypatch, tmp_path):
+        data_dir = self._local_dir(tmp_path, freshness="OLD")
+        self._patch(
+            monkeypatch,
+            lambda: "NEW",  # feed changed -> would download
+            lambda: (_ for _ in ()).throw(httpx.ReadTimeout("slow")),
+        )
+
+        _static, changed = gs.check_and_update(str(data_dir), str(tmp_path / "static.db"))
+
+        assert changed is False
+
+    def test_download_error_without_local_raises(self, monkeypatch, tmp_path):
+        data_dir = tmp_path / "gtfs-static"
+        self._patch(
+            monkeypatch,
+            lambda: "NEW",
+            lambda: (_ for _ in ()).throw(httpx.ReadTimeout("slow")),
+        )
+
+        with pytest.raises(httpx.ReadTimeout):
+            gs.check_and_update(str(data_dir), str(tmp_path / "static.db"))

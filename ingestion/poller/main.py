@@ -4,8 +4,9 @@ periods, and pushes the public rollup to S3.
   1. Load/refresh GTFS static from the local zip
   2. Fetch GTFS-RT trip updates
   3. Extract observations, enrich with route/stop ids, UPSERT into SQLite
-  4. Prune out-of-window service dates into the all-time baseline (fold +
-     delete), refresh the daily archive chronicle, upload changed archives
+  4. Prune out-of-window service dates into the all-time baseline (fold once,
+     drain the store incrementally), refresh the daily archive chronicle,
+     upload changed archives
   5. Build the 4-period current.json → write locally → S3 public/current.json
   6. Persist state.json (service date + last poll time)
 
@@ -20,6 +21,7 @@ later phases. Local state/ files are always the source of truth; S3 uploads
 are best-effort (warn, never crash the cycle).
 """
 
+import gzip
 import sys
 import time
 from datetime import datetime, timezone
@@ -32,7 +34,7 @@ import poller.gtfs_rt as gtfs_rt
 import poller.gtfs_static as gtfs_static
 import poller.route_geometries as route_geometries
 import poller.s3 as s3
-from poller.constants import EASTERN
+from poller.constants import ARCHIVE_QUIET_WINDOW_MINUTES, EASTERN
 from poller.rollup import (
     build_current,
     prune_window,
@@ -40,7 +42,7 @@ from poller.rollup import (
     save_baseline,
     write_json,
 )
-from poller.state import ObservationsDB, load_state, save_state
+from poller.state import ObservationsDB, load_state, save_state, to_iso_date
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -61,32 +63,70 @@ def _eastern_today() -> str:
     return datetime.now(EASTERN).date().isoformat()
 
 
-def _archive_elapsed_dates(db, current_sd) -> None:
-    """Archive every store service date strictly before current_sd.
+def _archive_elapsed_dates(db, present, stats=None) -> None:
+    """Archive elapsed store dates once they've gone quiet (capture-all).
 
-    Fires once a new service day starts: dates fully elapsed (older than the
-    current service date) are written to archive/observations/<sd>.parquet,
-    uploaded, then deleted locally (S3 is the sole copy / eternal ledger).
-
-    A date already present at archive/observations/<sd>.parquet on S3 is
-    skipped to avoid re-uploading a finalized archive. On a successful upload
-    the local parquet is removed; on a failure it is kept so the next cycle
-    retries.
+    A date is archived only after it has been absent from the feed for
+    ARCHIVE_QUIET_WINDOW_MINUTES (its store max poll is that old), so the full
+    overnight straggler tail is captured instead of freezing at the midnight
+    switchover. It is re-archived (overwrite) whenever a later straggler batch
+    advances the store past the archive's footer as_of_poll — the eternal
+    ledger ends up with every observation. Overwriting is fail-closed: an
+    existing archive is only replaced when its footer read confirms the store
+    is not mid-drain, and an unreadable footer is skipped, never overwritten.
+    `stats` is an optional precomputed service_date_stats().
     """
+    if not present:
+        return
+    present = {to_iso_date(d) for d in present}
+    min_present = min(present)
+    quiet_since = int(time.time()) - ARCHIVE_QUIET_WINDOW_MINUTES * 60
     obs_dir = STATE_DIR / "archive" / "observations"
-    for sd, _ in db.service_date_stats():
-        if sd >= current_sd:
+    fs = s3.filesystem()
+    for sd, max_poll in (stats or db.service_date_stats()):
+        if sd >= min_present or not max_poll:
             continue
+        if max_poll > quiet_since:
+            continue  # still being updated — stragglers may keep arriving
         key = f"archive/observations/{sd}.parquet"
-        if s3.object_exists(key):
+        try:
+            archived_poll, archived_rows = archives.read_archive_meta(
+                s3.full_path(key), filesystem=fs
+            )
+        except FileNotFoundError:
+            archived_poll, archived_rows = None, None
+        except Exception as e:
+            # Footer unreadable (S3/WiFi hiccup, corrupt object, ...). We cannot
+            # tell whether the existing archive is complete, so refuse to touch
+            # it — the next cycle retries. Overwriting here is how 2026-09-08
+            # lost rows: a transient read error was read as "nothing archived".
+            print(
+                f"  [archive] {key} skipped: footer unreadable "
+                f"({type(e).__name__}: {e}) — refusing to overwrite",
+                flush=True,
+            )
+            continue
+        if archived_poll and max_poll <= archived_poll:
+            continue  # already archived through this poll
+        store_count = db.count(sd)
+        if archived_rows is not None and store_count < archived_rows:
+            # The store no longer holds the full day (the date is mid-drain).
+            # Re-archiving from the partial store would overwrite a complete
+            # archive with fewer rows — refuse; the straggler driving this is
+            # garbage for a week-old date and gets drained anyway.
+            print(
+                f"  [archive] {key} skipped: store {store_count:,} < archive "
+                f"{archived_rows:,} rows (mid-drain)",
+                flush=True,
+            )
             continue
         rows = db.export_day(sd)
         if not rows:
             continue
-        path = archives.write_observations(rows, str(obs_dir))
+        path = archives.write_observations(rows, str(obs_dir), as_of_poll=max_poll)
         if s3.upload(key, path):
             path.unlink()
-            print(f"  [archive] {key} uploaded + deleted", flush=True)
+            print(f"  [archive] {key} uploaded (as_of_poll={max_poll})", flush=True)
 
 
 def _existing_registry(key: str) -> dict:
@@ -160,8 +200,14 @@ def main():
     # 2. Fetch + parse the RT feed
         t2 = time.perf_counter()
         print("fetching trip updates...", flush=True)
-        raw = gtfs_rt.fetch_protobuf(gtfs_rt.BUS_TRIP_UPDATES)
-        feed = gtfs_rt.parse_trip_updates(raw)
+        try:
+            feed = gtfs_rt.fetch_trip_updates(gtfs_rt.BUS_TRIP_UPDATES)
+        except gtfs_rt.FeedUnavailable as e:
+            # Transient (WiFi/DNS/SEPTA hiccup) or truncated payload. Skip the
+            # cycle cleanly: the store and current.json are untouched, so the
+            # dashboard keeps serving the last good rollup. Next tick retries.
+            print(f"  [rt] {e} — skipping this cycle", flush=True)
+            return
         _log_time("fetch + parse", time.perf_counter() - t2)
 
         active_trips = {
@@ -217,35 +263,62 @@ def main():
         print(f"  {len(rows)} observations extracted", flush=True)
 
     # 4. Persist: prune the window, refresh the chronicle, roll up current.json
+        t = time.perf_counter()
         db.upsert(rows)
+        _log_time("upsert", time.perf_counter() - t)
 
         present = {r["service_date"] for r in rows}
+        t = time.perf_counter()
         store_dates = db.store_dates()
         current_sd = (
             max(present).isoformat()
             if present
             else (store_dates[-1] if store_dates else _eastern_today())
         )
+        stats = db.service_date_stats()
         print(f"  service date: {current_sd}", flush=True)
+        _log_time("store+stats", time.perf_counter() - t)
 
-        _archive_elapsed_dates(db, current_sd)
+        t = time.perf_counter()
+        _archive_elapsed_dates(db, present, stats)
+        _log_time("archive", time.perf_counter() - t)
 
-        baseline, pruned = prune_window(db, str(STATE_DIR), current_sd)
+        t = time.perf_counter()
+        baseline, pruned = prune_window(db, str(STATE_DIR), current_sd, stats=stats)
         if pruned:
             save_baseline(str(STATE_DIR), baseline)
             s3.upload("state/all-baseline.json", STATE_DIR / "all-baseline.json")
             print("  baseline rolled up for aged-out service dates", flush=True)
+        _log_time("prune", time.perf_counter() - t)
 
-        for sd in refresh_daily_chronicle(db, str(STATE_DIR), current_sd):
+        t = time.perf_counter()
+        rewritten = refresh_daily_chronicle(
+            db, str(STATE_DIR), current_sd, stats=stats,
+            folded_through=baseline.get("max_service_date"),
+        )
+        for sd in rewritten:
             s3.upload(f"state/daily/{sd}.json", STATE_DIR / "daily" / f"{sd}.json")
+        _log_time("daily refresh", time.perf_counter() - t)
 
         t_rollup = time.perf_counter()
         current = build_current(db, metadata, str(STATE_DIR), current_sd=current_sd)
         _log_time("rollup", time.perf_counter() - t_rollup)
-        write_json(current, STATE_DIR / "current.json")
-        s3.upload("public/current.json", STATE_DIR / "current.json", cache_control=CURRENT_CACHE_CONTROL)
 
-        print(f"  observations total: {db.count()}", flush=True)
+        t = time.perf_counter()
+        write_json(current, STATE_DIR / "current.json")
+        _log_time("write", time.perf_counter() - t)
+
+        t = time.perf_counter()
+        # The S3 object is gzip-compressed + served with Content-Encoding: gzip,
+        # so browsers transparently decode it on fetch (no frontend change). The
+        # local current.json stays raw (source of truth). mtime=0 -> deterministic.
+        gz_path = STATE_DIR / "current.json.gz"
+        gz_path.write_bytes(gzip.compress((STATE_DIR / "current.json").read_bytes(), mtime=0))
+        s3.upload("public/current.json", gz_path,
+                  cache_control=CURRENT_CACHE_CONTROL, content_encoding="gzip")
+        gz_path.unlink()
+        _log_time("upload", time.perf_counter() - t)
+
         save_state(str(STATE_DIR), current_sd, datetime.now(timezone.utc).timestamp())
     finally:
         if db is not None:

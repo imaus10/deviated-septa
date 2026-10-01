@@ -7,6 +7,7 @@ local state/ files are always the source of truth, so upload failures warn
 but never crash the poll cycle.
 """
 
+import json
 import os
 
 import boto3
@@ -61,6 +62,7 @@ def upload_file(
     client=None,
     cache_control: str | None = None,
     content_type: str = "application/json",
+    content_encoding: str | None = None,
 ) -> None:
     """Upload a local file to s3://bucket/key."""
     bucket = bucket or os.environ["S3_BUCKET"]
@@ -70,6 +72,8 @@ def upload_file(
         extra["CacheControl"] = cache_control
     if content_type:
         extra["ContentType"] = content_type
+    if content_encoding:
+        extra["ContentEncoding"] = content_encoding
     client.upload_file(str(local_path), bucket, key, ExtraArgs=extra or None)
 
 
@@ -86,6 +90,22 @@ def object_exists(key: str, *, bucket: str | None = None, client=None) -> bool:
         return True
     except Exception:
         return False
+
+
+def read_json(key: str, *, bucket: str | None = None, client=None) -> dict | None:
+    """Read + parse a JSON object from S3. None if the key doesn't exist.
+
+    Only a missing key (NoSuchKey/404) maps to None; any other error propagates
+    so a restore/DR read fails loudly instead of silently treating a transient S3
+    problem as "no chronicle for this date."
+    """
+    bucket = bucket or os.environ["S3_BUCKET"]
+    client = client or _make_client()
+    try:
+        body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except client.exceptions.NoSuchKey:
+        return None
+    return json.loads(body)
 
 
 def upload(key: str, path, **meta) -> bool:

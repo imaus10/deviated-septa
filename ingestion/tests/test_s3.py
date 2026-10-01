@@ -13,11 +13,30 @@ import pytest
 import poller.s3 as s3
 
 
+class _NoSuchKey(Exception):
+    pass
+
+
+class _Exceptions:
+    NoSuchKey = _NoSuchKey
+
+
+class _Body:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def read(self):
+        return self._raw
+
+
 class FakeClient:
+    exceptions = _Exceptions()
+
     def __init__(self):
         self.calls = []
         self.existing = set()
         self.objects = {}
+        self.bodies = {}
 
     def upload_file(self, path, bucket, key, ExtraArgs=None):
         self.calls.append((path, bucket, key, ExtraArgs))
@@ -28,6 +47,12 @@ class FakeClient:
         if Key not in self.existing:
             raise Exception("404")
         return {}
+
+    def get_object(self, Bucket=None, Key=None):
+        self.calls.append(("get", Bucket, Key))
+        if Key not in self.bodies:
+            raise _NoSuchKey(Key)
+        return {"Body": _Body(self.bodies[Key])}
 
     def list_objects_v2(self, Bucket=None, Prefix=None, ContinuationToken=None):
         self.calls.append(("list", Bucket, Prefix, ContinuationToken))
@@ -84,6 +109,27 @@ class TestUploadFile:
         assert extra == {
             "CacheControl": "max-age=55, stale-while-revalidate=5",
             "ContentType": "application/json",
+        }
+
+    def test_sets_content_encoding_when_gzipped(self, monkeypatch, tmp_path):
+        _set_env(
+            monkeypatch,
+            S3_BUCKET="deviated-septa-dev",
+            S3_ACCESS_KEY_ID="AK",
+            S3_SECRET_ACCESS_KEY="SK",
+        )
+        fake = FakeClient()
+        _mock_client(monkeypatch, fake)
+        p = tmp_path / "current.json.gz"
+        p.write_bytes(b"gzipped")
+
+        s3.upload_file(p, "public/current.json", content_encoding="gzip")
+
+        path, bucket, key, extra = fake.calls[0]
+        assert key == "public/current.json"
+        assert extra == {
+            "ContentType": "application/json",
+            "ContentEncoding": "gzip",
         }
 
 
@@ -160,6 +206,40 @@ class TestDownloadFile:
 
         assert dest.read_bytes() == b"data"
         assert fake.calls[0][:3] == ("download", "b", "archive/observations/2026-08-28.parquet")
+
+
+class TestReadJson:
+    def test_parses_object(self, monkeypatch, tmp_path):
+        _set_env(monkeypatch, S3_BUCKET="b", S3_ACCESS_KEY_ID="AK", S3_SECRET_ACCESS_KEY="SK")
+        fake = FakeClient()
+        p = tmp_path / "daily.json"
+        p.write_text('{"service_date":"2026-09-08"}', encoding="utf-8")
+        fake.bodies = {"state/daily/2026-09-08.json": p.read_bytes()}
+        _mock_client(monkeypatch, fake)
+
+        assert s3.read_json("state/daily/2026-09-08.json") == {"service_date": "2026-09-08"}
+
+    def test_missing_key_returns_none(self, monkeypatch):
+        _set_env(monkeypatch, S3_BUCKET="b", S3_ACCESS_KEY_ID="AK", S3_SECRET_ACCESS_KEY="SK")
+        fake = FakeClient()
+        fake.bodies = {}
+        _mock_client(monkeypatch, fake)
+
+        assert s3.read_json("state/daily/1999-01-01.json") is None
+
+    def test_transient_error_propagates(self, monkeypatch):
+        """Only a missing key means "absent" — a real S3 error must fail loudly."""
+        _set_env(monkeypatch, S3_BUCKET="b", S3_ACCESS_KEY_ID="AK", S3_SECRET_ACCESS_KEY="SK")
+        fake = FakeClient()
+
+        def boom(Bucket=None, Key=None):
+            raise TimeoutError("s3 timed out")
+
+        fake.get_object = boom
+        _mock_client(monkeypatch, fake)
+
+        with pytest.raises(TimeoutError):
+            s3.read_json("state/daily/2026-09-08.json")
 
 
 class TestDeleteObject:
