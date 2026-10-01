@@ -85,14 +85,13 @@ through CloudFront OAC when `use_cloudfront=true`); `state/` + `archive/` are pr
 ### Data integrity notes
 
 - **Known raw-ledger gap: `2026-09-08`.** That archive holds 36,449 rows instead of the full
-  770,789 (the rest are unrecoverable — Neon only holds `2026-07-21..2026-09-04`, and the store
-  had drained). A transient footer-read failure made the old guard read as "not archived",
-  letting a partial store overwrite it. The fix is the fail-closed archive guard above. The
-  rollup stays correct: the 09-08 daily + folded `all-baseline.json` retain the full totals, so
-  only the raw parquet is short. **Do not run `scripts/rebuild_baseline.py`** — it would fold the
-  short ledger into the baseline and corrupt the (correct) rollup to match the lossy parquet.
-  `scripts/restore_state.py` therefore folds finalized dates from the S3 daily chronicle rather than
-  the raw parquet, so a DR restore reproduces the full 770,789 and logs a warning about the gap.
+  770,789 (the rest are unrecoverable — the source database only holds `2026-07-21..2026-09-04`,
+  and the store had drained). A transient footer-read failure made the old guard read as
+  "not archived", letting a partial store overwrite it. The fix is the fail-closed archive guard
+  above. The rollup stays correct: the 09-08 daily + folded `all-baseline.json` retain the full
+  totals, so only the raw parquet is short. `scripts/restore_state.py` therefore folds finalized
+  dates from the S3 daily chronicle rather than the raw parquet, so a DR restore reproduces the
+  full 770,789 and logs a warning about the gap.
 
 
 ### Key files (ingestion)
@@ -108,8 +107,7 @@ through CloudFront OAC when `use_cloudfront=true`); `state/` + `archive/` are pr
 | `poller/archives.py` | Parquet writers/readers; consolidation-aware `build_registries()` (active open-ended, dropped routes closed with observation-derived `valid_to` windows, existing rows never deleted/reopened). |
 | `poller/route_geometries.py` | Spider-walk polyline generator: `build_geometries(static, metadata)` streams stop_times from StaticDB. |
 | `scripts/restore_state.py` | Rebuild local state from the S3 ledger (bootstrap/DR); streams parquet in bounded batches. Enumerates dates from the union of S3 archives + S3 dailies + local dailies so a date is never dropped because its archive went missing; folded dates prefer the S3 **daily chronicle** (parquet only when no daily exists, a staged local daily as the last resort, which is then re-uploaded to S3); a full restore wipes local baseline and *stages* `daily/` (removed only on success) so it can neither double-count nor destroy a date's last copy. |
-| `scripts/cutover.py` | One-shot Pi cutover: preflight → static/bootstrap+geometries → drop today's partial archive → restore → verify. Dry-run default, `--apply` to execute. |
-| `scripts/migrate_neon.py` | **Temporary** — historical Neon→S3 import (needs `psycopg2` + `DATABASE_URL*`). Remove once the migration is fully retired. |
+| `scripts/backfill_daily.py` | Rebuild a missing `state/daily/<sd>.json` from its raw archive. Dry-run default. Fail-closed: refuses to overwrite an existing daily, an unreadable footer, a row-count/category mismatch, or a short archive next to its neighbours. |
 
 ## Frontend
 
@@ -159,7 +157,6 @@ Frontend reads root `.env` via Vite's `envDir: '..'`. `VITE_PUBLIC_URL` is the S
 | `S3_BUCKET` | Poller/scripts | S3 bucket name (`deviated-septa-dev` or `-prod`) |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Poller/scripts | Poller IAM creds (explicit, never default chain) |
 | `VITE_PUBLIC_URL` | Frontend | S3 `public/` URL (CloudFront domain or bucket endpoint) |
-| `DATABASE_URL` / `DATABASE_URL_UNPOOLED` | `migrate_neon.py` | **Temporary** — Neon strings for the one-off historical import |
 
-Prod S3 creds live in `.env.prod` (gitignored); the poller/cutover scripts load it via
+Prod S3 creds live in `.env.prod` (gitignored); the poller/restore scripts load it via
 `--env-file` or pre-exported vars. `.env` and `.env.prod` are gitignored.

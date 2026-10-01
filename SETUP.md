@@ -19,7 +19,7 @@ Copy `.env.example` to `.env` and fill in:
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Poller IAM creds (bucket-scoped) |
 | `VITE_PUBLIC_URL` | Frontend data source — the S3 `public/` URL the dashboard fetches `current.json` + `geometries.json` from |
 
-Prod creds live in a separate `.env.prod` (gitignored); the poller/cutover scripts load it via
+Prod creds live in a separate `.env.prod` (gitignored); the poller/restore scripts load it via
 `--env-file` or pre-exported vars.
 
 ---
@@ -58,17 +58,20 @@ state/                 # runtime + rollups
 
 ---
 
-## 4. Restore / cut over from the S3 ledger
+## 4. Restore local state from the S3 ledger
 
-If you're bootstrapping from the S3 archive (DR) or cutting the Pi over from Neon:
+If you're bootstrapping from scratch or recovering (DR), rebuild local state from the
+`archive/observations/*.parquet` ledger in S3:
 
 ```bash
-cd ingestion && uv run python -m scripts.cutover --apply --env-file ../.env.prod
+cd ingestion && uv run python -m scripts.restore_state --dry-run   # preview
+cd ingestion && uv run python -m scripts.restore_state             # apply
 ```
 
-`cutover.py` (dry-run by default) restores the 7-date store window + baseline from
-`archive/observations/*.parquet`, uploads `public/geometries.json`, and verifies. To rebuild
-local state from S3 only, use `scripts/restore_state.py`.
+`restore_state.py` (apply by default) restores the 7-date store window + baseline, regenerates
+`state/daily/` + `current.json`, and uploads the results. Add `--date YYYY-MM-DD` to rebuild a
+single service date. To repair a single missing daily chronicle entry, use
+`scripts/backfill_daily.py`.
 
 ---
 
@@ -117,10 +120,3 @@ Set `VITE_PUBLIC_URL` in root `.env` to a reachable data source (e.g. the dev bu
 Deploy: push to `main` touching `frontend/**` → `.github/workflows/deploy.yml` builds with the
 `VITE_PUBLIC_URL` GitHub secret and publishes to GitHub Pages. Set the secret to the S3 `public/`
 URL (CloudFront domain when `use_cloudfront=true`, otherwise the bucket endpoint).
-
----
-
-## 7. Historical import from Neon (temporary)
-
-The one-off Neon → S3 import lives in `ingestion/scripts/migrate_neon.py` (needs `psycopg2` +
-`DATABASE_URL*`). It is being retired after the Pi cutover completes; do not build on it.

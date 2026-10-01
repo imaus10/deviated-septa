@@ -159,7 +159,7 @@ def delete_object(
     bucket: str | None = None,
     client=None,
 ) -> None:
-    """Delete s3://bucket/key. Used by cutover to drop a partial today archive."""
+    """Delete s3://bucket/key. Not used by the poll cycle — recovery tooling only."""
     bucket = bucket or os.environ["S3_BUCKET"]
     client = client or _make_client()
     client.delete_object(Bucket=bucket, Key=key)
